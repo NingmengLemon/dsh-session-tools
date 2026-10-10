@@ -13,6 +13,7 @@ from pathlib import Path
 from time import time_ns
 
 from .config import Config
+from .contract import check, self_test
 from .errors import ToolError
 from .frames import ArtifactError, decode_frames, decode_header
 from .operations import (
@@ -465,6 +466,43 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_contract(args: argparse.Namespace) -> int:
+    """Check this tool's view of a store against what DSH itself accepts."""
+    if args.self_test:
+        config = Config.resolve(args.dsh_home)
+        report = self_test(config.sessions_root)
+        print("contract self-test: build a store, move a session, ask real DSH")
+    else:
+        config = Config.resolve(args.dsh_home)
+        report = check(config.sessions_root, dsh_home_path=args.dsh_install)
+        print(f"sessions root      : {report.sessions_root}")
+
+    if report.skipped is not None:
+        print(f"\nskipped: {report.skipped}")
+        return 2
+
+    print(f"DSH installation   : {report.dsh_root}")
+    print(f"DSH lists          : {len(report.dsh_sessions)} session(s)")
+    print(f"this tool sees     : {len(report.tool_sessions)} session(s)")
+    print(f"DSH opened         : {len(report.dsh_events)} session(s)")
+
+    print(f"\nfailures           : {len(report.failures)}")
+    for message in report.failures:
+        print(f"  ! {message}")
+
+    if report.pre_existing:
+        print(f"\nalready unopenable in this store ({len(report.pre_existing)}), not caused by this tool:")
+        for message in report.pre_existing[:10]:
+            print(f"  ? {message}")
+        if len(report.pre_existing) > 10:
+            print(f"  ? ... and {len(report.pre_existing) - 10} more")
+
+    if report.ok:
+        print("\nDSH and this tool agree on every session.")
+        return 0
+    return 1
+
+
 # --- entry point --------------------------------------------------------------
 
 
@@ -515,6 +553,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="report mismatches and unregistered cwds")
     doctor.set_defaults(func=cmd_doctor)
+
+    contract = subparsers.add_parser(
+        "contract",
+        help="check this tool's view against what the installed DSH accepts",
+    )
+    contract.add_argument(
+        "--dsh-install",
+        metavar="PATH",
+        help="the installed @deepseek-ai/dsh package to drive (default: found automatically)",
+    )
+    contract.add_argument(
+        "--self-test",
+        action="store_true",
+        help="build a throwaway store, move a session in it, and ask DSH about the result",
+    )
+    contract.set_defaults(func=cmd_contract)
 
     return parser
 
