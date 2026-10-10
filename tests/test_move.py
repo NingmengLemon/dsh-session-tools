@@ -92,10 +92,56 @@ def test_scan_reports_an_unreadable_header_instead_of_crashing(home: FakeHome) -
         ("session.v4.jsonl.zstd.move-tmp", None),
         ("session.v4.jsonl.zstd.pre-sourcemigrate-1", None),
         ("other.jsonl.zstd", None),
+        # DSH rejects a version above Number.MAX_SAFE_INTEGER, so we must too.
+        ("session.v9007199254740991.jsonl.zstd", 2**53 - 1),
+        ("session.v9007199254740992.jsonl.zstd", None),
+        ("session.v99999999999999999999.jsonl.zstd", None),
     ],
 )
 def test_parse_generation(filename: str, expected: int | None) -> None:
     assert parse_generation(filename) == expected
+
+
+def test_scan_reports_a_directory_mixing_both_encodings(home: FakeHome) -> None:
+    """A backend is configured for one encoding and DSH refuses the other.
+
+    ``resolveGenerationInDirectory`` throws ``encodingMismatch`` when a session
+    directory carries the opposite suffix, so a mixed directory is one DSH will
+    not load. Reporting it beats reading the highest version of it quietly.
+    """
+    alpha = home.workspace_dir("alpha")
+    directory = home.sessions_root / project_key(str(alpha)) / encode_segment(SESSION)
+    header: dict[str, object] = {
+        "type": "session",
+        "version": 4,
+        "id": SESSION,
+        "cwd": str(alpha),
+    }
+    write_artifact(directory, filename="session.v4.jsonl.zstd", header=header, lines=['{"seq":1}'])
+    write_artifact(
+        directory,
+        filename="session.v3.jsonl",
+        header={**header, "version": 3},
+        lines=['{"seq":1}'],
+        compressed=False,
+    )
+
+    scan = scan_sessions(home.sessions_root)
+    assert not scan.sessions
+    assert len(scan.problems) == 1
+    assert "both zstd and uncompressed" in scan.problems[0].reason
+
+
+def test_scan_accepts_several_generations_of_one_encoding(home: FakeHome) -> None:
+    """Retained generations are normal: DSH reads the highest and keeps the rest."""
+    alpha = home.workspace_dir("alpha")
+    home.session(session_id=SESSION, cwd=str(alpha), version=3)
+    home.session(session_id=SESSION, cwd=str(alpha), version=4)
+
+    scan = scan_sessions(home.sessions_root)
+    assert len(scan.sessions) == 1
+    assert not scan.problems
+    assert [artifact.version for artifact in scan.sessions[0].artifacts()] == [4, 3]
 
 
 # --- planning -----------------------------------------------------------------
@@ -364,7 +410,8 @@ def test_describe_mismatch_detects_a_relocated_header(home: FakeHome) -> None:
     session = scan_sessions(home.sessions_root).by_id(SESSION)[0]
     assert describe_mismatch(session) is None
 
-    # Rewrite cwd the way a naive tool would, without relocating the artifact.
+    # Rewrite cwd without relocating the artifact, which is the state an earlier
+    # version of this tool produced and reported as success.
     plan_header = decode_header(path.read_bytes(), label="t")
     from dsh_session_tools.frames import replace_header_frame
 
@@ -375,8 +422,62 @@ def test_describe_mismatch_detects_a_relocated_header(home: FakeHome) -> None:
     report = describe_mismatch(moved)
     assert report is not None
     assert "its cwd implies" in report
-    # The session is still discoverable: DSH reads the header, not the location.
     assert moved.cwd == str(beta)
+
+
+def test_move_refuses_a_session_that_is_already_mismatched(home: FakeHome) -> None:
+    """The guard that stops this tool from writing the state it once produced.
+
+    A header whose cwd does not name the directory the artifact sits in is a log
+    DSH calls corrupt, and it makes ``list()`` throw for the whole store. Carrying
+    such a session forward would spread that, so planning refuses it outright.
+    """
+    alpha = home.workspace_dir("alpha")
+    beta = home.workspace_dir("beta")
+    gamma = home.workspace_dir("gamma")
+    path = home.session(session_id=SESSION, cwd=str(alpha))
+    home.write_registry([("a", str(alpha)), ("b", str(beta))])
+
+    # Point the header at a workspace the artifact does not live under.
+    header = decode_header(path.read_bytes(), label="t")
+    from dsh_session_tools.frames import replace_header_frame
+
+    rewritten, _ = replace_header_frame(path.read_bytes(), {**header, "cwd": str(gamma)}, label="t")
+    path.write_bytes(rewritten)
+
+    registry = load_registry(home.root)
+    session = scan_sessions(home.sessions_root).by_id(SESSION)[0]
+    outcome = plan_move(session, workspace_at(registry, beta), registry)
+
+    assert isinstance(outcome, MoveFailure)
+    assert "corrupt" in outcome.reason
+    assert "Nothing was written" in outcome.reason
+
+
+def test_move_refuses_a_workspace_reached_through_a_link(home: FakeHome) -> None:
+    """DSH resolves the cwd and compares it to the stored workspace path.
+
+    When those spellings differ, the session is filtered out of every workspace
+    with only a warning logged, so a move there is refused rather than silently
+    detaching the session from everything.
+    """
+    alpha = home.workspace_dir("alpha")
+    real = home.workspace_dir("real-target")
+    link = home.root / "workspaces" / "linked-target"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform will not create a directory link here")
+
+    home.session(session_id=SESSION, cwd=str(alpha))
+    home.write_registry([("a", str(alpha)), ("b", str(link))])
+    registry = load_registry(home.root)
+    session = scan_sessions(home.sessions_root).by_id(SESSION)[0]
+
+    outcome = plan_move(session, workspace_at(registry, link), registry)
+    assert isinstance(outcome, MoveFailure)
+    assert "resolves to" in outcome.reason
+    assert "no workspace" in outcome.reason
 
 
 def test_write_artifact_uses_the_expected_directory(home: FakeHome) -> None:

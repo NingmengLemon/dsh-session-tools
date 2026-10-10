@@ -90,9 +90,46 @@ def test_encode_segment_rejects_empty() -> None:
         encode_segment("")
 
 
+def test_astral_characters_escape_as_surrogate_pairs() -> None:
+    """Beyond the BMP the original walks UTF-16 code units, not code points.
+
+    JavaScript indexes a string by code unit, so U+1F600 becomes the two escapes
+    for its surrogate pair. Iterating Python code points would emit ``~1F600``
+    and put the session in a differently named directory than DSH would.
+    """
+    assert project_key("/😀/x") == "--~D83D~DE00-x--"
+    assert project_key("/😀😁") == "--~D83D~DE00~D83D~DE01--"
+    assert encode_segment("😀") == "~D83D~DE00"
+    assert encode_segment("x😀y") == "x~D83D~DE00y"
+    # A code-point encoding would have produced a five-digit escape here.
+    assert "~1F600" not in encode_segment("😀")
+
+
+def test_bmp_characters_escape_as_single_units() -> None:
+    """A CJK path is inside the BMP, so one code point is one escape."""
+    assert project_key("/开发/~agent") == "--~5F00~53D1-~007Eagent--"
+    assert encode_segment("é") == "~00E9"
+    # A lone surrogate survives the round trip rather than raising.
+    assert encode_segment("\ud800") == "~D800"
+
+
 def test_directory_helpers_compose() -> None:
     from pathlib import Path
 
     root = Path("/sessions")
     assert project_dir(root, r"E:\a\b") == Path("/sessions/--E-a-b--")
     assert session_dir(root, r"E:\a\b", "session-1") == Path("/sessions/--E-a-b--/session-1")
+
+
+def test_a_header_without_cwd_uses_the_shared_directory() -> None:
+    """DSH files a cwd-less session under ``_no-cwd`` rather than refusing it."""
+    from pathlib import Path
+
+    from dsh_session_tools.paths import NO_CWD_DIRECTORY
+
+    root = Path("/sessions")
+    assert NO_CWD_DIRECTORY == "_no-cwd"
+    assert project_dir(root, None) == Path("/sessions/_no-cwd")
+    assert session_dir(root, None, "session-1") == Path("/sessions/_no-cwd/session-1")
+    # And it is not the same as the empty-path project key, which is refused.
+    assert project_dir(root, None) != project_dir(root, "/")
