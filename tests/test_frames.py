@@ -84,7 +84,26 @@ def test_scan_ignores_magic_bytes_inside_a_payload() -> None:
     assert decoded[2] == b'{"seq":3}\n'
 
 
-def test_decode_rejects_a_torn_final_frame() -> None:
+def test_decode_handles_a_frame_larger_than_the_read_chunk() -> None:
+    """The plaintext must be pulled in chunks, not in one sized request.
+
+    A reader reserves what it is asked for, so requesting the whole ceiling makes
+    every frame allocate it. On a real library that failed outright on a 34 MiB
+    frame. This builds a frame comfortably larger than the chunk size so the loop
+    has to run more than once.
+    """
+    from dsh_session_tools import frames as frames_module
+
+    body = "\n".join(f'{{"seq":{index},"pad":"{"x" * 200}"}}' for index in range(40_000))
+    raw = build(HEADER) + frame((body + "\n").encode())
+
+    decoded = decode_frames(raw, label="t")
+    assert len(decoded) == 2
+    assert len(decoded[1]) > frames_module._READ_CHUNK
+    assert decoded[1].endswith(b"\n")
+
+
+def test_a_torn_final_frame_is_refused() -> None:
     """A truncated tail frame is refused, not silently accepted as whole."""
     whole = build(HEADER, '{"seq":1}', '{"seq":2}')
     frames = scan_frames(whole)

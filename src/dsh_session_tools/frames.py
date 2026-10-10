@@ -176,22 +176,39 @@ def _walk_one_frame(raw: bytes, *, start: int, label: str) -> int:
     return position
 
 
+#: How much plaintext to pull from a frame at a time. The reader reserves the
+#: size it is asked for, so asking for the whole ceiling defeats the point of
+#: streaming and reintroduces the allocation failure this replaced.
+_READ_CHUNK = 8 * 2**20
+
+
 def decompress_frame(raw: bytes, frame: Frame, *, label: str) -> bytes:
     """Decompress one frame, validating its checksum.
 
-    The plaintext is read through a stream rather than requested with a fixed
-    ``max_output_size``, because that ceiling is reserved per frame and a real
-    library contains frames whose plaintext runs to hundreds of megabytes.
+    The plaintext is pulled in bounded chunks rather than in one request, because
+    a reader reserves the size it is asked for: a one-shot request for the whole
+    ceiling fails on a real library exactly as ``max_output_size`` did.
 
     Raises:
         ArtifactError: when the frame does not decode, is truncated, or its
             plaintext would exceed :data:`_MAX_FRAME_PLAINTEXT`.
     """
     blob = raw[frame.start : frame.end]
+    chunks: list[bytes] = []
+    total = 0
     try:
-        reader = zstandard.ZstdDecompressor().stream_reader(blob)
-        with reader:
-            plain = reader.read(_MAX_FRAME_PLAINTEXT + 1)
+        with zstandard.ZstdDecompressor().stream_reader(blob) as reader:
+            while True:
+                chunk = reader.read(_READ_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_FRAME_PLAINTEXT:
+                    raise ArtifactError(
+                        f"{label}: frame at {frame.start} expands beyond "
+                        f"{_MAX_FRAME_PLAINTEXT} bytes; refusing"
+                    )
+                chunks.append(chunk)
     except zstandard.ZstdError as error:
         raise ArtifactError(f"{label}: frame at {frame.start} does not decode: {error}") from error
     except MemoryError as error:
@@ -199,13 +216,9 @@ def decompress_frame(raw: bytes, frame: Frame, *, label: str) -> bytes:
             f"{label}: not enough memory to decode the frame at {frame.start}; close other programs and retry"
         ) from error
 
-    if len(plain) > _MAX_FRAME_PLAINTEXT:
-        raise ArtifactError(
-            f"{label}: frame at {frame.start} expands beyond {_MAX_FRAME_PLAINTEXT} bytes; refusing"
-        )
-    if not plain:
+    if total == 0:
         raise ArtifactError(f"{label}: frame at {frame.start} is empty")
-    return plain
+    return b"".join(chunks)
 
 
 def decode_frames(raw: bytes, *, label: str, verify_lines: bool = False) -> tuple[bytes, ...]:
