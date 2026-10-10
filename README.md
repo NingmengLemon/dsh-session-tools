@@ -3,32 +3,16 @@
 Typed tooling for DeepSeek Harness session artifacts: inspect them, verify them,
 and **move a session between workspaces**.
 
-The move is one operation: rewrite the `cwd` field inside the stored session
-header. Nothing is deleted, no directory is created, no log body is re-encoded,
-and `workspace.json` is never touched.
+A move is two coupled changes, and DSH rejects the result if only one is made:
+the artifact is relocated into the project directory the new workspace names,
+**and** the `cwd` in its stored header is rewritten to that workspace. Neither
+half is sufficient on its own.
 
-## Why rewriting one header field is the whole job
+## Why both halves are required
 
-Two facts about DSH 0.2.0-rc.2, both read from the shipping source rather than
-assumed, make the registry irrelevant to a move.
-
-**A session's workspace is derived from its own header, not from a registry list.**
-`dsh-workspace/lib/index.js:102-104`:
-
-```js
-get sessionIds() {
-    return this.record.sessionIds.filter(
-        (id) => this.host.sessionPath(id) === this.record.path);
-}
-```
-
-The per-workspace `sessionIds` array is a cache DSH re-filters on every read.
-Editing it would be redundant, and trusting it would be wrong. Attaching a
-session validates only the header's `cwd`: it must resolve, be a directory, and
-equal the workspace path (`dsh-workspace/lib/index.js:114-122`).
-
-**The artifact's location is itself derived from `cwd` + `id`.**
-`dsh-session-persistence-jsonl/lib/index.js:914-927`:
+**The artifact's location is derived from `cwd` + `id`, and that derivation is
+enforced on every read.** `dsh-session-persistence-jsonl/lib/index.js:914-927`
+derives the path:
 
 ```js
 function sessionDir(root, cwd, id) { return join(projectDir(root, cwd), encodeSegment(id)); }
@@ -37,10 +21,40 @@ function generationLogPath(root, cwd, id, version, compression) {
 }
 ```
 
-So the header *is* the membership. Change the header and the session reports as
-belonging to the new workspace, leaving the artifact where it is. Old entries in
-the previous workspace's cached list become inert, exactly as a deleted
-session's leftovers do.
+and `:3383-3395` asserts it:
+
+```js
+expectedPath = generationLogPath(this.root, meta.cwd, meta.id, storedVersion, this.compression);
+if (path !== expectedPath && !await this.sameFile(path, expectedPath, signal))
+    throw new Error(`corrupt session log "${path}": header id "${meta.id}" and cwd identify "${expectedPath}"`);
+```
+
+That assertion runs from `readGenerationHeader` (`:3091`), so it fires on every
+`list()` and `stat()`, and from `decodeStoredLog` (`:2820`), so it fires on every
+`open()`. It raises a plain `Error`, and `listArtifacts` swallows only the two
+typed errors (`:3043`), so it escapes `list()` into the workspace registry, the
+ACP session list and the session query.
+
+The consequence is out of proportion to the change: rewriting a header without
+relocating the artifact does not move one session, it makes the whole store
+unreadable, because `list()` throws rather than skipping the offending entry.
+
+**A session's workspace comes from its header, not from a registry list.** So
+`workspace.json` still never needs editing. `dsh-workspace/lib/index.js:102-104`:
+
+```js
+get sessionIds() {
+    return this.record.sessionIds.filter(
+        (id) => this.host.sessionPath(id) === this.record.path);
+}
+```
+
+`indexHeader` (`:872-890`) resolves the header's `cwd` and compares the result
+against the stored workspace path verbatim. That is why the `cwd` written here is
+the registry's path exactly as it is spelled, never a canonicalised version of
+it, and why a workspace whose path resolves elsewhere is refused: writing its
+spelling would file the session under no workspace at all, with only a warning
+logged.
 
 ## Why only the first frame is touched
 
@@ -52,15 +66,21 @@ and DSH's reader depends on that structure:
 * each later frame carries one durable event batch
 * every frame is written with the checksum flag (`CHECKSUM_OPTIONS`, `:1291`)
 
-That is why this tool replaces the first frame and copies every remaining frame
-as raw bytes. It is also why re-encoding the whole log into one frame is a defect
-rather than a shortcut: a single frame holding header plus events fails the
-first-frame contract, and DSH then refuses to read the log.
+So a rewrite replaces the first frame and copies every remaining frame as raw
+bytes. Re-encoding the whole log into one frame is a defect rather than a
+shortcut: a single frame holding header plus events fails the first-frame
+contract and DSH refuses the log.
+
+Frame boundaries are found by walking each frame's own structure, the way DSH
+does (`scanZstdFrames`, `:1300-1363`). Searching for the 4-byte magic number and
+trusting every hit is unsound, because those bytes occur inside compressed
+payloads and split one frame in two; that was observed on real artifacts here,
+not merely in theory.
 
 A related trap this tool avoids on purpose: **`version` is never re-stamped.**
 Writing the current format version into an older log's header makes DSH classify
-it as malformed (`released v2 physical header lacks isSeeded`) and drop it from
-`persistence.list()`, so the session silently disappears.
+it as malformed and drop it from `persistence.list()`, so the session silently
+disappears.
 
 ## Install
 
@@ -71,17 +91,26 @@ uv sync
 ## Use
 
 ```powershell
-# 1. Verify every artifact decodes frame-by-frame and satisfies DSH's contract.
+# 1. Ask the installed DSH itself whether it accepts the store, and whether this
+#    tool sees the same sessions. This is the check worth trusting; it drives the
+#    real backend rather than reimplementing its rules.
+uv run dsh-sessions contract
+
+# 2. The same check against a throwaway store this tool builds and moves, using a
+#    real artifact as the subject. Nothing in your library is touched.
+uv run dsh-sessions contract --self-test
+
+# 3. Verify every artifact decodes frame-by-frame and every line is JSON.
 uv run dsh-sessions verify
 
-# 2. List the registry and every cwd group.
+# 4. List the registry and every cwd group.
 uv run dsh-sessions list
 uv run dsh-sessions list --from "E:\Projects\Python\UniversalWorkspace"
 
-# 3. See what a move would do. Nothing is written.
+# 5. See what a move would do. Nothing is written.
 uv run dsh-sessions move --session <id> --to "<target workspace path>" --dry-run
 
-# 4. Do it. Refuses while a DSH process is running unless --force.
+# 6. Do it. Refuses while a DSH process is running unless --force.
 uv run dsh-sessions move --session <id> --to "<target workspace path>"
 
 # Undo one artifact from its backup.
@@ -99,6 +128,8 @@ A refusal prints a reason and exits 1; it is never reported as success.
 
 | Condition | Why |
 |---|---|
+| Header and location already disagree | DSH calls such a log corrupt and `list()` throws for the whole store |
+| Target workspace path resolves elsewhere | DSH resolves the cwd and compares it to the unresolved stored path, so the session would land in no workspace |
 | Session is a subagent | moving one is almost always a mistake; `--allow-subagent` overrides |
 | Session is archived | unarchive first; `--allow-archived` overrides |
 | Target is not a registered workspace | the path must also be an existing directory |
@@ -112,45 +143,38 @@ log is corrupt" is not a policy decision.
 
 * Nothing is written until every artifact of the session has been read, validated
   and rebuilt in memory.
-* Each artifact is copied to a `.bak-<epoch-ms>` sibling before it is replaced.
-* Replacement goes through a temporary file and an atomic rename, so an
-  interrupted run cannot leave a half-written log.
-* After writing, the session is re-read and the stored `cwd` is asserted to be
-  the target. Success is never reported on faith.
-* Nothing is ever deleted, and no directory is ever created.
+* Every payload is staged beside its destination before anything is replaced, so
+  a failure while staging leaves the store untouched.
+* Each replacement is preceded by a `.bak-<epoch-ms>` sibling copy and performed
+  by renaming the staged file over the target, which is atomic on one volume.
+* After writing, the session is re-read and both halves of the move are asserted:
+  the stored `cwd` is the target, and the artifact sits in the project directory
+  that `cwd` names. Success is never reported on faith.
+* `--keep-backups` keeps the byte copies; without it they are removed once the
+  destination has been verified. Files the tool did not create are reported and
+  left alone.
 
-### Backups accumulate
+### Reversing a move
 
-Every move leaves one `.bak-<epoch-ms>` file per artifact, and nothing removes
-them. Moving a hundred sessions leaves a hundred backups, each the size of the
-log it came from. DSH ignores these files — they are not canonical artifact
-names, so they are never read or counted as sessions — but they do occupy disk.
-
-Reclaim the space once you are satisfied the moves are correct:
-
-```powershell
-# List them first.
-Get-ChildItem "$env:USERPROFILE\.dsh\sessions" -Recurse -File -Filter "*.bak-*" |
-    Measure-Object -Property Length -Sum
-
-# Then remove them. This is the only destructive command in this project's docs.
-Get-ChildItem "$env:USERPROFILE\.dsh\sessions" -Recurse -File -Filter "*.bak-*" |
-    Remove-Item -WhatIf
-```
-
-Drop `-WhatIf` to actually delete. An interrupted write can also leave a
-`*.move-tmp` file; those are safe to remove the same way.
+`restore` places the backup's bytes where that file's own header says they
+belong, and parks the copy that was current under a backup name. Writing the
+bytes back where the backup sits would rebuild the corrupt state the refusal
+above exists to prevent, and leaving the current copy in place would give DSH an
+id in two project directories, which it also refuses
+(`findLog`, `dsh-session-persistence-jsonl/lib/index.js:3370`).
 
 ## Layout
 
 ```
 src/dsh_session_tools/
-  frames.py       the concatenated-zstd container: scan, decode, rebuild
-  paths.py        DSH's two on-disk encodings (projectKey, encodeSegment)
-  sessions.py     discovery under <dshHome>/sessions
-  workspaces.py   the workspace registry document, and path canonicalisation
-  operations.py   plan a move, apply it, verify it
-  cli.py          the command line
+  frames.py          the concatenated-zstd container: walk, decode, rebuild
+  paths.py           DSH's two on-disk encodings (projectKey, encodeSegment)
+  sessions.py        discovery under <dshHome>/sessions
+  workspaces.py      the workspace registry document, and path canonicalisation
+  operations.py      plan a move, apply it, verify it
+  contract.py        check this tool's view against the installed DSH
+  dsh_contract.mjs   the node side of that check, driving the real backend
+  cli.py             the command line
 ```
 
 ## Development
@@ -160,17 +184,19 @@ uv run ruff check .
 uv run ruff format --check .
 uvx ty check
 uv run pytest
+uv run dsh-sessions contract --self-test
 ```
 
 ## Scope and limits
 
 Read this before trusting it with a library you care about.
 
-* **This implementation was validated by byte-comparison against an
-  independently written Node implementation** of the same operation, on a real
-  artifact: identical SHA-256, and the restore path reproduced the original bytes
-  exactly. The test suite covers the container contract, the encodings, and the
-  refusal paths.
+* **The move is verified against the shipped DSH backend.** `contract
+  --self-test` copies a real artifact into a throwaway home, checks DSH accepts
+  it, moves it with the real planner and applier, and checks DSH accepts it again
+  with the same event count. Reintroducing the header-only rewrite makes that
+  check report zero sessions after the move, which is the failure mode it exists
+  to catch.
 * **It has not been exercised against a live DSH session.** Close DSH before
   moving anything. The liveness check is a heuristic and is deliberately biased
   toward false positives, so a "DSH looks alive" warning may appear when it is.
@@ -179,8 +205,15 @@ Read this before trusting it with a library you care about.
 * **Unregistered cwds are reported, not reconciled.** Sessions under a path that
   is not a registered workspace show as ungrouped in DSH; this tool will not move
   them *into* such a path, and it reports them so you can decide.
-* The frame-boundary scan locates frames by the zstd magic number. A compressed
-  payload could in principle contain those four bytes and split one frame into
-  two bogus ranges; that is not silent corruption, because every range is
-  decompressed and a bogus split fails JSON validation. The approach was checked
-  against all 1000 artifacts (782,720 frames) in the development library.
+* **`verify` parses every line as JSON, and that dominates its running time.** On
+  this machine's library, 349 artifacts and 318,632 frames take about 76 seconds.
+  A move does not pay that cost: it validates container integrity, which is what
+  it depends on, and leaves line parsing to `verify`.
+* The reports below are from the development library, and the numbers are
+  measured rather than estimated: 233 session directories, 108 of which hold
+  several retained generations, 349 artifacts, 601 MiB compressed, 318,632
+  frames.
+* **Six artifacts in the development library are listed by DSH but will not
+  open**, as v0 logs whose descriptor version it no longer supports. They predate
+  this tool; `contract` reports them separately so a real divergence is not
+  buried among them.

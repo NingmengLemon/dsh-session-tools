@@ -502,3 +502,33 @@ def test_uncompressed_artifact_is_read_too(home: FakeHome) -> None:
     assert [session.session_id for session in scan.sessions] == [SESSION]
     assert scan.sessions[0].version == 0
     assert path.read_text().endswith("\n")
+
+
+# --- the contract this tool exists to keep ------------------------------------
+
+
+def test_move_puts_the_artifact_where_its_header_says(home: FakeHome) -> None:
+    """The one invariant DSH enforces on every read.
+
+    ``assertStoredIdentity`` derives the artifact path from the header's cwd and
+    id and refuses the log when the file is not there. A move that satisfies only
+    the header half passes this tool's own post-check and still makes DSH call the
+    session corrupt, which is the defect this test exists to prevent.
+    """
+    _, beta = build(home)
+    registry = load_registry(home.root)
+    session = scan_sessions(home.sessions_root).by_id(SESSION)[0]
+
+    plan = plan_move(session, workspace_at(registry, beta), registry)
+    assert isinstance(plan, MovePlan)
+    apply_plan(plan)
+
+    moved = scan_sessions(home.sessions_root)
+    assert len(moved.sessions) == 1
+    stored = moved.sessions[0]
+    assert stored.cwd == str(beta)
+    # The header's own claim and the directory agree, which is exactly what DSH
+    # compares before it will read the log at all.
+    assert stored.project_dir_name == project_key(stored.cwd)
+    assert describe_mismatch(stored) is None
+    verify_move(session, workspace_at(registry, beta))
