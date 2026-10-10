@@ -151,8 +151,14 @@ def test_apply_changes_only_the_header_and_keeps_body_frames(home: FakeHome) -> 
     assert isinstance(plan, MovePlan)
     applied = apply_plan(plan)
 
-    assert applied[0].backup is not None
-    after = artifact.read_bytes()
+    change = applied.changes[0]
+    assert change.backup is not None
+    # The artifact itself has to end up where the header now says it lives.
+    assert change.destination == applied.target_directory / artifact.name
+    assert change.destination.is_file()
+    assert not artifact.exists()
+
+    after = change.destination.read_bytes()
     assert after != before
 
     before_frames = scan_frames(before)
@@ -177,11 +183,11 @@ def test_backup_restores_the_original_bytes(home: FakeHome) -> None:
     plan = plan_move(session, workspace_at(registry, beta), registry)
     assert isinstance(plan, MovePlan)
     applied = apply_plan(plan)
-    backup = applied[0].backup
+    backup = applied.changes[0].backup
     assert backup is not None
 
-    artifact.write_bytes(backup.read_bytes())
-    assert artifact.read_bytes() == before
+    # The backup is a byte-for-byte copy of what was displaced.
+    assert backup.read_bytes() == before
 
 
 def test_already_in_target_is_a_noop(home: FakeHome) -> None:

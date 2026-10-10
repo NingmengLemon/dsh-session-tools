@@ -10,12 +10,21 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+from time import time_ns
 
 from .config import Config
 from .errors import ToolError
-from .frames import ArtifactError, decode_frames
-from .operations import MoveFailure, apply_plan, describe_mismatch, plan_move, verify_move
-from .sessions import ScanResult, Session, scan_sessions
+from .frames import ArtifactError, decode_frames, decode_header
+from .operations import (
+    BACKUP_MARKER,
+    MoveFailure,
+    apply_plan,
+    describe_mismatch,
+    plan_move,
+    verify_move,
+)
+from .paths import encode_segment, project_key
+from .sessions import ScanResult, Session, parse_generation, scan_sessions
 from .workspaces import Registry, Workspace, canonical, load_registry
 
 _PROGRAM = "dsh-sessions"
@@ -219,7 +228,13 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_move(args: argparse.Namespace) -> int:
-    """Move one session to another workspace by rewriting its header's cwd."""
+    """Move one session to another workspace.
+
+    Two things change together, and both are required: the header's ``cwd``, and
+    the directory the artifacts live in. DSH derives the artifact path from the
+    header and enforces that derivation on every read, so changing only the
+    header makes the session a log DSH calls corrupt.
+    """
     config = Config.resolve(args.dsh_home)
     registry, scan = _load(config)
     session = _find_session(scan, args.session)
@@ -234,7 +249,7 @@ def cmd_move(args: argparse.Namespace) -> int:
     )
 
     if isinstance(outcome, MoveFailure):
-        print(f"{outcome.session_id}: refused — {outcome.reason}")
+        print(f"{outcome.session_id}: refused - {outcome.reason}")
         return 1
 
     changes = outcome.changes
@@ -244,6 +259,8 @@ def cmd_move(args: argparse.Namespace) -> int:
     source = outcome.source
     print(f"cwd       : {session.cwd}   [{source.title if source else 'not a registered workspace'}]")
     print(f"target    : {target.path}   [{target.title}]")
+    if outcome.relocates:
+        print(f"relocate  : {outcome.source_directory.parent.name} -> {outcome.target_directory.parent.name}")
     print()
 
     for change in changes:
@@ -256,15 +273,14 @@ def cmd_move(args: argparse.Namespace) -> int:
             )
 
     if outcome.is_noop:
-        print("\nnothing to do — the session already belongs to that workspace")
+        print("\nnothing to do - the session already belongs to that workspace")
         return 0
 
     if args.dry_run:
-        print("\ndry run — nothing was written. Re-run without --dry-run to apply.")
+        print("\ndry run - nothing was written. Re-run without --dry-run to apply.")
         return 0
 
-    running = dsh_looks_running()
-    if running:
+    if dsh_looks_running():
         print("\nwarning: a DSH process looks alive. A live DSH appends to session logs,")
         print("         so writing now risks losing events. Close DSH first.")
         if not args.force:
@@ -272,37 +288,155 @@ def cmd_move(args: argparse.Namespace) -> int:
             return 1
 
     applied = apply_plan(outcome)
-    for change in applied:
+    for change in applied.changes:
         if change.backup is not None:
             print(f"  backed up: {change.backup}")
 
-    verify_move(session, target)
-    print(f"\ndone — {session.session_id} now reports as belonging to {target.title}.")
-    print("start DSH; the session should appear under that workspace.")
+    directory = verify_move(session, target)
+    print(f"\ndone - {session.session_id} is now stored under {target.title}.")
+    print(f"       artifact : {directory}")
+    print("       start DSH; the session should appear under that workspace.")
+
+    leftovers = applied.leftovers
+    if applied.moved:
+        # The destination is verified above, so whatever is still in the old
+        # directory is either a byte copy of what now lives here, or a file this
+        # tool never owned. Only the first kind is removed.
+        reclaimed, leftovers = reclaim_source_directory(
+            applied.source_directory, keep_backups=args.keep_backups
+        )
+        if reclaimed:
+            print(f"       reclaimed: {reclaimed}")
+
+    if leftovers:
+        print("\n       not touched, and not created by this tool:")
+        for leftover in leftovers:
+            print(f"         {leftover}")
     return 0
+
+
+def reclaim_source_directory(directory: Path, *, keep_backups: bool) -> tuple[str | None, tuple[Path, ...]]:
+    """Remove the emptied session directory, and the byte copies a move took.
+
+    Only reached once the move has been verified, so the copies being removed are
+    duplicates of bytes that are already readable at their destination. With
+    ``keep_backups`` they stay behind, which is what ``restore`` wants them for.
+
+    Returns:
+        A description of what was removed, if anything, and whatever is genuinely
+        still in the old directory.
+    """
+    if not directory.is_dir():
+        return None, ()
+    try:
+        if not keep_backups:
+            for entry in list(directory.iterdir()):
+                if entry.is_file() and BACKUP_MARKER in entry.name:
+                    entry.unlink()
+        remaining = tuple(sorted(directory.iterdir()))
+        if remaining:
+            return None, remaining
+        directory.rmdir()
+        parent = directory.parent
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            return f"{parent.name} and its session directory are now empty and removed", ()
+        return f"{directory.name} is now empty and removed", ()
+    except OSError as error:
+        return f"could not remove {directory}: {error}", ()
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
-    """Put one artifact back from a ``.bak-<epoch-ms>`` sibling."""
+    """Undo a move from one ``.bak-<epoch-ms>`` copy.
+
+    The backup holds the bytes as they were before a move, which means its header
+    names the workspace the session came from. Writing those bytes back where the
+    backup sits would produce exactly the state DSH calls corrupt, so the copy is
+    placed where its own header says it belongs and the live artifact is moved
+    aside first. Restoring therefore reverses both halves of a move.
+    """
     source = Path(args.backup)
     if not source.is_file():
         raise ToolError(f"backup not found: {source}")
-    if not source.name.rsplit(".", 1)[-1].startswith("bak-"):
-        raise ToolError(f"refusing: {source.name} does not look like a .bak-<epoch-ms> file")
-
-    target = source.with_name(source.name.rsplit(".bak-", 1)[0])
+    if BACKUP_MARKER not in source.name:
+        raise ToolError(f"refusing: {source.name} does not look like a {BACKUP_MARKER}<epoch-ms> file")
     if source.stat().st_size == 0:
         raise ToolError(f"refusing: {source} is empty")
 
-    current = target.read_bytes() if target.is_file() else None
-    backup = source.read_bytes()
-    if current == backup:
-        print(f"{target} already matches {source.name}; nothing to do")
-        return 0
+    artifact_name = source.name.split(BACKUP_MARKER, 1)[0]
+    if parse_generation(artifact_name) is None:
+        raise ToolError(f"refusing: {artifact_name!r} is not a canonical artifact name")
 
-    target.write_bytes(backup)
-    print(f"restored {target} from {source.name}")
+    raw = source.read_bytes()
+    try:
+        header = decode_header(raw, label=artifact_name)
+    except ArtifactError as error:
+        raise ToolError(
+            f"refusing: {source.name} does not hold a readable session header: {error}"
+        ) from error
+
+    session_id = header.get("id")
+    cwd = header.get("cwd")
+    if not isinstance(session_id, str) or not isinstance(cwd, str):
+        raise ToolError(f"refusing: {source.name} has no usable id and cwd to place it by")
+
+    destination = source.parent.parent.parent / project_key(cwd) / encode_segment(session_id) / artifact_name
+
+    # DSH refuses a log when the same id appears under two project directories
+    # (findLog, dsh-session-persistence-jsonl/lib/index.js:3370), so the live copy
+    # has to leave the directory it currently occupies. Putting it back where the
+    # restored bytes came from would only create the mirror of that problem, so it
+    # is kept beside itself instead.
+    live = _live_artifacts(session_id, exclude=source)
+    if live and not args.discard_current:
+        parked: list[Path] = []
+        for path in live:
+            # The destination is about to be overwritten, so it may stay put and
+            # be replaced. Any other live copy would become a duplicate id.
+            if path == destination:
+                continue
+            where = _park(path)
+            if where is not None:
+                parked.append(where)
+        if parked:
+            print("the copy that was current is kept as:")
+            for path in parked:
+                print(f"  {path}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(raw)
+    source.unlink()
+    print(f"restored {destination}")
+    print(f"  from   {source}  (removed)")
+    print(f"  cwd    {cwd}")
     return 0
+
+
+def _live_artifacts(session_id: str, *, exclude: Path) -> tuple[Path, ...]:
+    """Every canonical artifact of ``session_id`` in the current sessions root."""
+    sessions_root = exclude.parent.parent.parent
+    encoded = encode_segment(session_id)
+    found: list[Path] = []
+    if not sessions_root.is_dir():
+        return ()
+    for project in sessions_root.iterdir():
+        candidate = project / encoded
+        if not candidate.is_dir():
+            continue
+        for entry in candidate.iterdir():
+            if entry.is_file() and parse_generation(entry.name) is not None:
+                found.append(entry)
+    return tuple(sorted(found))
+
+
+def _park(path: Path) -> Path | None:
+    """Move one live artifact aside under a backup name, returning where it went."""
+    parked = path.with_name(f"{path.name}{BACKUP_MARKER}{time_ns() // 1_000_000}")
+    try:
+        path.replace(parked)
+    except OSError:
+        return None
+    return parked
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -363,10 +497,20 @@ def build_parser() -> argparse.ArgumentParser:
     move.add_argument("--force", action="store_true", help="proceed even if DSH looks alive")
     move.add_argument("--allow-subagent", action="store_true", help="allow moving a subagent session")
     move.add_argument("--allow-archived", action="store_true", help="allow moving an archived session")
+    move.add_argument(
+        "--keep-backups",
+        action="store_true",
+        help="keep the byte copies taken during the move instead of reclaiming them",
+    )
     move.set_defaults(func=cmd_move)
 
     restore = subparsers.add_parser("restore", help="restore one artifact from its backup")
     restore.add_argument("backup", metavar="FILE.bak-MS", help="the backup file to restore from")
+    restore.add_argument(
+        "--discard-current",
+        action="store_true",
+        help="delete the artifact that is current instead of keeping it under a backup name",
+    )
     restore.set_defaults(func=cmd_restore)
 
     doctor = subparsers.add_parser("doctor", help="report mismatches and unregistered cwds")
