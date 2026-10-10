@@ -1,0 +1,16 @@
+# Every text file in this repository is stored with LF, including on Windows.
+# Without this, `core.autocrlf=true` rewrites the working tree to CRLF and every
+# tool that reads the sources sees different bytes than the repository holds.
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Session artifacts used as test fixtures stay binary.
+*.zstd binary
+*.bak-* binary

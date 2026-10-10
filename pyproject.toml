@@ -1,0 +1,53 @@
+[project]
+name = "dsh-session-tools"
+version = "0.1.0"
+description = "Inspect, verify and re-home DeepSeek Harness session artifacts (move sessions between workspaces)"
+readme = "README.md"
+authors = [
+    { name = "NingmengLemon", email = "60469383+NingmengLemon@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "zstandard>=0.25.0",
+]
+
+[project.scripts]
+dsh-sessions = "dsh_session_tools.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.0",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    # Long messages are the point in a tool whose whole value is clear refusals.
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dsh_session_tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
