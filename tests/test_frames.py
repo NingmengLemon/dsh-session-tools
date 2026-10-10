@@ -59,6 +59,40 @@ def test_scan_finds_every_frame() -> None:
         assert earlier.end == later.start
 
 
+def test_scan_ignores_magic_bytes_inside_a_payload() -> None:
+    """A magic number inside a compressed payload is not a frame boundary.
+
+    Searching for the magic and trusting every hit splits one frame in two, and
+    the halves do not decode. This was observed on real artifacts, not just
+    constructed: it is why boundaries are walked out of the frame structure.
+    """
+    import struct
+
+    magic = struct.pack("<I", 4247762216)
+    # One body frame whose payload carries the magic bytes verbatim, so a byte
+    # search is guaranteed to report a boundary in the middle of it.
+    body = b'{"seq":1}\n' + magic + b'{"seq":2}\n'
+    raw = build(HEADER) + frame(body) + frame(b'{"seq":3}\n')
+
+    frames = scan_frames(raw)
+    assert len(frames) == 3
+    assert raw[frames[1].start : frames[1].end] == frame(body)
+
+    # And the split must survive decoding, not merely look right.
+    decoded = decode_frames(raw, label="t")
+    assert decoded[1] == body
+    assert decoded[2] == b'{"seq":3}\n'
+
+
+def test_decode_rejects_a_torn_final_frame() -> None:
+    """A truncated tail frame is refused, not silently accepted as whole."""
+    whole = build(HEADER, '{"seq":1}', '{"seq":2}')
+    frames = scan_frames(whole)
+    torn = whole[: frames[-1].end - 5]
+    with pytest.raises(ArtifactError, match="ends inside"):
+        decode_frames(torn, label="t")
+
+
 def test_scan_rejects_non_zstd() -> None:
     with pytest.raises(ArtifactError, match="no zstd frame"):
         scan_frames(b"not compressed at all")
@@ -95,9 +129,20 @@ def test_decode_rejects_missing_trailing_newline() -> None:
 
 
 def test_decode_rejects_invalid_json_line() -> None:
+    """Line validity is a separate gate from container integrity.
+
+    Container decoding answers "is this a set of whole frames whose first one is
+    the header", which is what a move depends on, and leaves line parsing to the
+    caller because parsing dominates the running time. `verify` asks for it.
+    """
     raw = build(HEADER, "this is not json")
+
+    # The container is intact, so the cheap gate passes it...
+    assert decode_frames(raw, label="t")
+
+    # ...and the line gate, which `dsh-sessions verify` turns on, rejects it.
     with pytest.raises(ArtifactError, match="not valid JSON"):
-        decode_frames(raw, label="t")
+        decode_frames(raw, label="t", verify_lines=True)
 
 
 def test_decode_rejects_corrupt_frame() -> None:

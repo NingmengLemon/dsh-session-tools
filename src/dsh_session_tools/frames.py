@@ -11,16 +11,29 @@ zstd frames**, and DSH's reader relies on that structure:
 * each frame is written with the checksum flag set —
   ``CHECKSUM_OPTIONS``, same file ``:1291``
 
-Two consequences drive this module's design:
+Frame boundaries are found by **walking each frame's own structure**, which is
+what DSH does (``scanZstdFrames``, same file ``:1300-1363``). The frame header
+declares how long its header fields are, and each 3-byte block header declares
+how long its payload is, so the end of a frame is arithmetic rather than a
+guess.
 
-1. **Frame boundaries must be found explicitly.** Python's one-shot
-   ``zstandard.ZstdDecompressor.decompress`` reads one frame and stops, exactly
-   like ``node:zlib``'s ``zstdDecompressSync``. Neither reports how many bytes it
-   consumed, so the boundary cannot be discovered by decompressing.
-2. **The body must never be re-encoded.** Rewriting only the first frame and
+The obvious shortcut, searching for the 4-byte zstd magic number and treating
+every hit as a boundary, is unsound: those bytes occur inside compressed
+payloads. On this machine's library that false positive is not hypothetical, it
+was observed on real artifacts, and it splits one frame into two ranges that do
+not decode. Searching is also what makes a scan slow. Walking is both exact and
+linear.
+
+Two consequences drive the rest of this module:
+
+1. **The body must never be re-encoded.** Rewriting only the first frame and
    copying the remaining frames as raw bytes keeps the log byte-identical apart
    from the header. Re-encoding the whole log into a single frame is the defect
    that breaks DSH's first-frame contract.
+2. **A frame's plaintext is streamed, not reserved.** Asking a decompressor for
+   a fixed output ceiling makes it reserve that much memory per frame, which
+   turns a routine read of a large real library into a spurious out-of-memory
+   failure.
 """
 
 from __future__ import annotations
@@ -37,10 +50,26 @@ from .errors import ToolError
 #: (``ZSTD_MAGIC``, ``dsh-session-persistence-jsonl/lib/index.js:1288``).
 ZSTD_MAGIC = 4247762216
 
+#: The magic as it appears on disk.
+_MAGIC_BYTES = ZSTD_MAGIC.to_bytes(4, "little")
+
 #: DSH writes every frame with a checksum, so we do too.
 _FRAME_WRITER = zstandard.ZstdCompressor(write_checksum=True)
 
-_MAX_FRAME_SIZE = 1 << 31
+#: Refuse to materialise one frame's plaintext beyond this. A single frame holds
+#: one durable event batch, so a size in this range means a decompression bomb or
+#: a damaged log rather than a session someone actually had. The limit bounds
+#: memory; it does not mirror a DSH rule, since DSH imposes no per-frame cap.
+_MAX_FRAME_PLAINTEXT = 1 << 30
+
+#: Block type 1 is a single raw byte, and ignores the declared size
+#: (RFC 8878 section 3.1.1.2). Type 3 is reserved.
+_BLOCK_TYPE_RLE = 1
+_BLOCK_TYPE_RESERVED = 3
+
+#: Frame-header descriptor tables (RFC 8878 section 3.1.1.1.1).
+_DICT_ID_SIZE = (0, 1, 2, 4)
+_FCS_SIZE_TABLE = (0, 2, 4, 8)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,87 +89,221 @@ class ArtifactError(ToolError):
 
 
 def scan_frames(raw: bytes) -> tuple[Frame, ...]:
-    """Locate every zstd frame in ``raw`` by scanning for the magic number.
-
-    A compressed payload may in principle contain the four magic bytes, which
-    would split one frame into two bogus ranges. That is not silent corruption
-    here: :func:`decode_frames` decompresses every range it is given, so a bogus
-    split makes a frame that does not decode to valid JSONL and is rejected.
-    The approach was validated against all 1000 artifacts in this machine's
-    library (782,720 frames) before any write path was enabled.
+    """Return every frame's byte range, in order.
 
     Raises:
-        ArtifactError: when ``raw`` holds no frame, or the first frame does not
-            begin at byte 0.
+        ArtifactError: when the bytes are not a clean concatenation of complete
+            frames, or the log does not begin with one.
     """
-    starts = [
-        offset
-        for offset in range(len(raw) - 3)
-        if int.from_bytes(raw[offset : offset + 4], "little") == ZSTD_MAGIC
-    ]
-    if not starts:
+    if not raw:
         raise ArtifactError("no zstd frame found")
-    if starts[0] != 0:
-        raise ArtifactError(f"first frame does not start at byte 0 (starts at {starts[0]})")
+    if not raw.startswith(_MAGIC_BYTES):
+        first = raw.find(_MAGIC_BYTES)
+        if first == -1:
+            raise ArtifactError("no zstd frame found")
+        raise ArtifactError(f"first frame does not start at byte 0 (starts at {first})")
+    return tuple(Frame(start=start, end=end) for start, end in _walk_frames(raw, label="log"))
 
-    return tuple(
-        Frame(start=start, end=starts[index + 1] if index + 1 < len(starts) else len(raw))
-        for index, start in enumerate(starts)
-    )
+
+def _walk_frames(raw: bytes, *, label: str) -> list[tuple[int, int]]:
+    """Walk the concatenation, returning each ``(start, end)``.
+
+    A torn final frame is refused rather than partially accepted. DSH recovers
+    one, because it may be looking at a log a crashed writer left behind; this
+    tool refuses, because every operation here rewrites a log, and a partial
+    frame is not something to rewrite around.
+    """
+    total = len(raw)
+    frames: list[tuple[int, int]] = []
+    position = 0
+    while position < total:
+        start = position
+        position = _walk_one_frame(raw, start=start, label=label)
+        frames.append((start, position))
+    return frames
+
+
+def _walk_one_frame(raw: bytes, *, start: int, label: str) -> int:
+    """Return the offset just past the frame beginning at ``start``."""
+    total = len(raw)
+    position = start
+    if position + 4 > total or raw[position : position + 4] != _MAGIC_BYTES:
+        raise ArtifactError(f"{label}: no frame magic at byte {position}")
+
+    position += 4
+    if position >= total:
+        raise ArtifactError(f"{label}: frame at {start} ends inside its own header")
+    descriptor = raw[position]
+    position += 1
+    if descriptor & 0x08:
+        raise ArtifactError(f"{label}: frame at {start} sets a reserved header bit")
+
+    content_size_flag = (descriptor >> 6) & 0x03
+    single_segment = (descriptor >> 5) & 0x01
+    has_checksum = bool((descriptor >> 2) & 0x01)
+    dictionary_size = _DICT_ID_SIZE[descriptor & 0x03]
+    if content_size_flag == 0:
+        # A single-segment frame always carries its content size, in one byte.
+        content_size_size = 1 if single_segment else 0
+    else:
+        content_size_size = _FCS_SIZE_TABLE[content_size_flag]
+    window_size = 0 if single_segment else 1
+
+    position += dictionary_size + window_size + content_size_size
+    if position > total:
+        raise ArtifactError(f"{label}: frame at {start} ends inside its header")
+
+    while True:
+        if position + 3 > total:
+            raise ArtifactError(f"{label}: frame at {start} ends inside a block header")
+        header = raw[position] | (raw[position + 1] << 8) | (raw[position + 2] << 16)
+        position += 3
+        last_block = bool(header & 0x01)
+        block_type = (header >> 1) & 0x03
+        block_size = header >> 3
+        if block_type == _BLOCK_TYPE_RESERVED:
+            raise ArtifactError(f"{label}: frame at {start} uses a reserved block type")
+        position += 1 if block_type == _BLOCK_TYPE_RLE else block_size
+        if position > total:
+            raise ArtifactError(f"{label}: frame at {start} ends inside a block payload")
+        if last_block:
+            break
+
+    if has_checksum:
+        position += 4
+        if position > total:
+            raise ArtifactError(f"{label}: frame at {start} ends inside its checksum")
+    return position
 
 
 def decompress_frame(raw: bytes, frame: Frame, *, label: str) -> bytes:
-    """Decompress exactly one frame, validating its checksum.
+    """Decompress one frame, validating its checksum.
+
+    The plaintext is read through a stream rather than requested with a fixed
+    ``max_output_size``, because that ceiling is reserved per frame and a real
+    library contains frames whose plaintext runs to hundreds of megabytes.
 
     Raises:
-        ArtifactError: when the range is not one complete, checksummed frame.
+        ArtifactError: when the frame does not decode, is truncated, or its
+            plaintext would exceed :data:`_MAX_FRAME_PLAINTEXT`.
     """
-    if frame.size > _MAX_FRAME_SIZE:
-        raise ArtifactError(f"{label}: frame at {frame.start} is implausibly large")
+    blob = raw[frame.start : frame.end]
     try:
-        return zstandard.ZstdDecompressor().decompress(
-            raw[frame.start : frame.end], max_output_size=_MAX_FRAME_SIZE
-        )
+        reader = zstandard.ZstdDecompressor().stream_reader(blob)
+        with reader:
+            plain = reader.read(_MAX_FRAME_PLAINTEXT + 1)
     except zstandard.ZstdError as error:
         raise ArtifactError(f"{label}: frame at {frame.start} does not decode: {error}") from error
+    except MemoryError as error:
+        raise ArtifactError(
+            f"{label}: not enough memory to decode the frame at {frame.start}; close other programs and retry"
+        ) from error
+
+    if len(plain) > _MAX_FRAME_PLAINTEXT:
+        raise ArtifactError(
+            f"{label}: frame at {frame.start} expands beyond {_MAX_FRAME_PLAINTEXT} bytes; refusing"
+        )
+    if not plain:
+        raise ArtifactError(f"{label}: frame at {frame.start} is empty")
+    return plain
+
+
+def decode_frames(raw: bytes, *, label: str, verify_lines: bool = False) -> tuple[bytes, ...]:
+    """Decode every frame and assert the container's structural invariants.
+
+    The invariants are the ones DSH's own reader enforces, so an artifact that
+    passes here is one DSH will accept:
+
+    * the bytes are a clean concatenation of complete frames
+    * every frame is non-empty and every checksum verifies
+    * the first frame is exactly one header line (the ``assertZstdHeaderFrame`` rule)
+    * the concatenated plaintext ends with a newline (no torn tail line)
+
+    Note which invariant is *not* here: a frame boundary is not required to fall
+    on a line boundary. DSH writes one batch per frame, and a batch holds many
+    newline-separated events, so most real frames carry several lines.
+
+    Args:
+        verify_lines: also parse every line as JSON. That is the difference
+            between proving the container is intact and proving its contents are
+            well-formed, and it costs most of the running time: parsing dominated
+            everything else on a measured sample. Callers that merely need the
+            header or the frame ranges leave it off, which is why a move no
+            longer pays for it. ``dsh-sessions verify`` turns it on.
+
+    Raises:
+        ArtifactError: on the first violated invariant.
+    """
+    frames = scan_frames(raw)
+    decoded = tuple(decompress_frame(raw, frame, label=label) for frame in frames)
+
+    _assert_header_frame(decoded[0], label=label)
+
+    text = b"".join(decoded)
+    if not text.endswith(b"\n"):
+        raise ArtifactError(f"{label}: log has no trailing newline (torn tail line)")
+
+    if verify_lines:
+        for number, line in enumerate(text[:-1].split(b"\n"), start=1):
+            try:
+                json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise ArtifactError(f"{label}: line {number} is not valid JSON: {error}") from error
+
+    return decoded
+
+
+def _assert_header_frame(plain: bytes, *, label: str) -> None:
+    """Assert DSH's ``assertZstdHeaderFrame`` rule: one line, nothing else."""
+    newlines = plain.count(b"\n")
+    if plain.find(b"\n") != len(plain) - 1:
+        raise ArtifactError(
+            f"{label}: first frame is not exactly one header line ({len(plain)} bytes, {newlines} newlines)"
+        )
 
 
 #: How much of an artifact to read when only the header is wanted. The header
 #: frame is the first line and compresses to a few hundred bytes even for very
-#: long paths; 64 KiB is far above anything observed. A file that does not yield
-#: a frame within this window is re-read in full before being called malformed.
+#: long paths, so one read settles it in practice; the window grows for the rare
+#: artifact whose first frame is large.
 _HEADER_READ_LIMIT = 64 * 1024
 
 
 def read_header_bytes(path: Path, *, label: str) -> bytes:
-    """Read enough of ``path`` to see its first frame.
-
-    Returns the bytes needed; the caller decodes the frame from them. Reading a
-    bounded prefix keeps a scan over a multi-hundred-megabyte library from
-    loading every event frame into memory just to look at a header.
-    """
-    with path.open("rb") as handle:
-        prefix = handle.read(_HEADER_READ_LIMIT)
-        if len(prefix) < _HEADER_READ_LIMIT:
-            return prefix
-        # The window may have cut the first frame short. A truncated zstd frame
-        # cannot be told apart from a complete one by inspection, so fall back to
-        # the whole file rather than guess.
-        try:
-            if scan_frames(prefix):
-                return prefix
-        except ArtifactError:
-            pass
-        return prefix + handle.read()
-
-
-def decode_header_frame(raw: bytes, *, label: str) -> bytes:
-    """Return the first frame's plaintext without decoding the rest of the log.
+    """Read exactly the bytes of ``path``'s first frame.
 
     Listing a library means reading the header of every artifact, and a library
     can hold hundreds of megabytes of event frames that no header read needs.
-    This decodes exactly one frame and asserts the invariant that applies to it:
-    the first frame is exactly one line.
+    The first frame's extent is arithmetic on its own header, so this returns
+    that frame and nothing more.
+
+    The window grows rather than assuming the header is small: a real artifact
+    can carry a first frame of hundreds of megabytes, and the walk has to see
+    the whole of it to report where it ends.
+    """
+    window = _HEADER_READ_LIMIT
+    with path.open("rb") as handle:
+        while True:
+            handle.seek(0)
+            prefix = handle.read(window)
+            whole_file = len(prefix) < window
+            try:
+                end = _walk_one_frame(prefix, start=0, label=label)
+                if end <= len(prefix):
+                    return prefix[:end]
+            except ArtifactError:
+                if whole_file:
+                    # The file is malformed and fully in hand; hand it over so the
+                    # caller's assertions produce the diagnosis.
+                    return prefix
+            if whole_file:
+                # The first frame runs past the end of the file.
+                return prefix
+            window *= 8
+
+
+def decode_header_frame(raw: bytes, *, label: str) -> bytes:
+    """Return the first frame's plaintext, without decoding the rest of the log.
 
     :func:`decode_frames` remains the full gate and is what the write path uses.
 
@@ -149,52 +312,8 @@ def decode_header_frame(raw: bytes, *, label: str) -> bytes:
     """
     frames = scan_frames(raw)
     header = decompress_frame(raw, frames[0], label=label)
-    newlines = header.count(b"\n")
-    if header.find(b"\n") != len(header) - 1:
-        raise ArtifactError(
-            f"{label}: first frame is not exactly one header line ({len(header)} bytes, {newlines} newlines)"
-        )
+    _assert_header_frame(header, label=label)
     return header
-
-
-def decode_frames(raw: bytes, *, label: str) -> tuple[bytes, ...]:
-    """Decode every frame and assert the container's structural invariants.
-
-    The invariants are the ones DSH's own reader enforces, so an artifact that
-    passes here is one DSH will accept:
-
-    * every frame is non-empty
-    * the first frame is exactly one header line (the ``assertZstdHeaderFrame`` rule)
-    * the concatenated plaintext ends with a newline (no torn tail line)
-    * every line parses as JSON
-
-    Raises:
-        ArtifactError: on the first violated invariant.
-    """
-    frames = scan_frames(raw)
-    decoded = tuple(decompress_frame(raw, frame, label=label) for frame in frames)
-
-    for index, plain in enumerate(decoded):
-        if not plain:
-            raise ArtifactError(f"{label}: frame {index} is empty")
-
-    header = decoded[0]
-    newlines = header.count(b"\n")
-    if header.find(b"\n") != len(header) - 1:
-        raise ArtifactError(
-            f"{label}: first frame is not exactly one header line ({len(header)} bytes, {newlines} newlines)"
-        )
-
-    text = b"".join(decoded).decode("utf-8")
-    if not text.endswith("\n"):
-        raise ArtifactError(f"{label}: log has no trailing newline (torn tail line)")
-    for number, line in enumerate(text[:-1].split("\n"), start=1):
-        try:
-            json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ArtifactError(f"{label}: line {number} is not valid JSON: {error}") from error
-
-    return decoded
 
 
 def decode_header(raw: bytes, *, label: str) -> dict[str, object]:
@@ -225,7 +344,7 @@ def encode_header(header: dict[str, object]) -> bytes:
     payload = (text + "\n").encode("utf-8")
     frame = _FRAME_WRITER.compress(payload)
 
-    check = zstandard.ZstdDecompressor().decompress(frame)
+    check = decompress_frame(frame, Frame(start=0, end=len(frame)), label="re-encoded header")
     if check != payload:
         raise ArtifactError("re-encoded header frame does not round-trip; refusing")
     return frame

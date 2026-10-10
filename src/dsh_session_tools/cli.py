@@ -136,7 +136,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             if not artifact.compressed:
                 continue
             try:
-                frames = decode_frames(artifact.path.read_bytes(), label=artifact.filename)
+                frames = decode_frames(artifact.path.read_bytes(), label=artifact.filename, verify_lines=True)
             except (ArtifactError, OSError) as error:
                 failures.append(f"{session.session_id} / {artifact.filename}: {error}")
                 continue
