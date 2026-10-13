@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .errors import ToolError
@@ -61,6 +62,17 @@ class Session:
     def version(self) -> int | None:
         value = self.header.get("version")
         return value if isinstance(value, int) else None
+
+    @property
+    def created_at(self) -> datetime | None:
+        """When DSH created the session, from the header's epoch-millisecond `createdAt`."""
+        value = self.header.get("createdAt")
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        try:
+            return datetime.fromtimestamp(value / 1000, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
 
     @property
     def origin(self) -> str | None:

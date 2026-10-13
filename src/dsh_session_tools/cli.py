@@ -48,16 +48,35 @@ def _short(text: str, width: int = 46) -> str:
     return text if len(text) <= width else text[: width - 1] + "\u2026"
 
 
+def _read_title(session: Session) -> str | None:
+    """The session's title as DSH folds it from the log, or ``None`` if untitled.
+
+    DSH keeps a title as a ``session/title`` event in the log, not in the header
+    (see :mod:`.titles`). Raises when the log cannot be read.
+    """
+    artifacts = session.artifacts()
+    return session_title(artifacts[0]) if artifacts else None
+
+
+def _created_key(session: Session) -> float:
+    """Sort key for creation time; sessions with no readable time sort last."""
+    created = session.created_at
+    return created.timestamp() if created is not None else float("-inf")
+
+
+def _stamp(session: Session) -> str:
+    created = session.created_at
+    return created.strftime("%Y-%m-%d %H:%M UTC") if created is not None else "(no time)"
+
+
 def _display_title(session: Session) -> str:
     """The label a person scans for: the session's title, or a stated placeholder.
 
-    DSH keeps a title as a ``session/title`` event in the log, not in the header,
-    so reading it means reading the log (see :mod:`.titles`). A log that cannot be
-    read says so, rather than presenting the session as untitled.
+    A log that cannot be read says so, rather than presenting the session as
+    untitled.
     """
-    artifacts = session.artifacts()
     try:
-        title = session_title(artifacts[0]) if artifacts else None
+        title = _read_title(session)
     except (ArtifactError, OSError):
         return "(title unreadable)"
     if title is None:
@@ -117,14 +136,51 @@ def _load(config: Config) -> tuple[Registry, ScanResult]:
     return registry, scan_sessions(config.sessions_root)
 
 
-def _find_session(scan: ScanResult, session_id: str) -> Session:
-    matches = scan.by_id(session_id)
-    if not matches:
-        raise ToolError(f"session not found: {session_id}")
-    if len(matches) > 1:
+def _find_session(scan: ScanResult, selector: str) -> Session:
+    """Resolve one session from an exact id, an id prefix, or part of its title.
+
+    The stages run in that order and the first one with any match decides, so an
+    exact id is never overridden by a title that happens to contain it. Reading
+    titles means reading logs, so that stage runs only when the id stages fail.
+    """
+    if not selector:
+        raise ToolError("the session selector is empty")
+    exact = scan.by_id(selector)
+    if exact:
+        return _unique(selector, exact)
+    by_prefix = [session for session in scan.sessions if session.session_id.startswith(selector)]
+    if by_prefix:
+        return _unique(selector, by_prefix)
+    by_title = [session for session in scan.sessions if _title_matches(session, selector)]
+    if by_title:
+        return _unique(selector, by_title)
+    raise ToolError(f"session not found: {selector}")
+
+
+def _unique(selector: str, matches: list[Session] | tuple[Session, ...]) -> Session:
+    """Return the one session ``matches`` names, or refuse and list the candidates."""
+    ids = {match.session_id for match in matches}
+    if len(ids) == 1:
+        if len(matches) == 1:
+            return matches[0]
         locations = ", ".join(str(match.directory) for match in matches)
         raise ToolError(f"session id appears in {len(matches)} directories: {locations}")
-    return matches[0]
+    shown = "\n".join(f"  {match.session_id}  {_display_title(match)}" for match in matches[:20])
+    more = f"\n  ... and {len(matches) - 20} more" if len(matches) > 20 else ""
+    raise ToolError(f"{selector!r} matches {len(ids)} sessions; give a longer id or title:\n{shown}{more}")
+
+
+def _title_matches(session: Session, needle: str) -> bool:
+    """Whether the session's title contains ``needle``, ignoring case.
+
+    A log that cannot be read simply does not match, so one damaged session never
+    blocks finding another. ``list`` is where damage is reported.
+    """
+    try:
+        title = _read_title(session)
+    except (ArtifactError, OSError):
+        return False
+    return title is not None and needle.casefold() in title.casefold()
 
 
 def _resolve_target(registry: Registry, raw: str) -> Workspace:
@@ -194,7 +250,8 @@ def cmd_list(args: argparse.Namespace) -> int:
             print(f"  workspace: {workspace.title if workspace else 'NOT REGISTERED'}")
             print()
             labels = {session.directory: _display_title(session) for session in sessions}
-            for session in sorted(sessions, key=lambda item: labels[item.directory].casefold()):
+            newest_first = sorted(sessions, key=_created_key, reverse=True)
+            for session in newest_first:
                 artifacts = session.artifacts()
                 flagged = describe_mismatch(session)
                 marks = []
@@ -208,7 +265,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                     marks.append(f"MISMATCH: {flagged}")
                 suffix = f"   [{', '.join(marks)}]" if marks else ""
                 print(f"  {_short(labels[session.directory], 72)}{suffix}")
-                print(f"      {session.session_id}")
+                print(f"      {session.session_id}   created {_stamp(session)}")
             return 0
         print(f"no sessions stored under {args.from_path}")
         return 1

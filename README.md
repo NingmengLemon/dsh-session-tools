@@ -104,15 +104,17 @@ uv run dsh-sessions contract --self-test
 uv run dsh-sessions verify
 
 # 4. List the registry and every cwd group. `--from` shows each session's title,
-#    read from its log, with the id beneath it.
+#    read from its log, its creation time, and its id, newest first.
 uv run dsh-sessions list
 uv run dsh-sessions list --from "E:\Projects\Python\UniversalWorkspace"
 
-# 5. See what a move would do. Nothing is written.
-uv run dsh-sessions move --session <id> --to "<target workspace path>" --dry-run
+# 5. See what a move would do. Nothing is written. --session takes a full id, a
+#    unique id prefix, or a fragment of the title; an ambiguous one is refused and
+#    lists the candidates.
+uv run dsh-sessions move --session <id-or-title> --to "<target workspace path>" --dry-run
 
 # 6. Do it. Refuses while a DSH process is running unless --force.
-uv run dsh-sessions move --session <id> --to "<target workspace path>"
+uv run dsh-sessions move --session <id-or-title> --to "<target workspace path>"
 
 # Undo one artifact from its backup.
 uv run dsh-sessions restore "<...>/session.v4.jsonl.zstd.bak-1791596004428"
@@ -219,7 +221,10 @@ Read this before trusting it with a library you care about.
   `session/title` event in the log, not in the header, so `list --from` decodes
   each listed session's current artifact to find the last one. Listing 54
   sessions this way took about 2.3 seconds on this machine. A plain `list`
-  reads headers only and pays nothing for titles.
+  reads headers only and pays nothing for titles. Selecting a session by title
+  reads logs too, but only after the id stages find nothing.
+* **Creation time comes from the header** (`createdAt`, epoch milliseconds). A
+  value that is missing or out of range shows as `(no time)` and sorts last.
 * **Six artifacts in the development library are listed by DSH but will not
   open**, as v0 logs whose descriptor version it no longer supports. They predate
   this tool; `contract` reports them separately so a real divergence is not
