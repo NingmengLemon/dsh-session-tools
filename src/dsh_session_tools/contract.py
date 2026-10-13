@@ -36,13 +36,19 @@ from .paths import encode_segment, project_key
 from .sessions import scan_sessions
 from .workspaces import load_registry
 
-#: Where a global npm install of DSH usually lands, checked in order.
+#: Where a global npm install of DSH usually lands, checked before asking npm.
+#: Nothing machine-specific belongs here: npm can name its own prefix, so a path
+#: from one development setup is a discovery rule for nobody else.
 _INSTALL_CANDIDATES = (
-    Path("E:/WorkBench/nodejs/npm-global/node_modules/@deepseek-ai/dsh"),
     Path.home() / "AppData/Roaming/npm/node_modules/@deepseek-ai/dsh",
+    Path.home() / ".npm-global/lib/node_modules/@deepseek-ai/dsh",
     Path("/usr/local/lib/node_modules/@deepseek-ai/dsh"),
     Path("/usr/lib/node_modules/@deepseek-ai/dsh"),
+    Path("/opt/homebrew/lib/node_modules/@deepseek-ai/dsh"),
 )
+
+#: Seconds allowed for ``npm root -g`` before it is treated as unavailable.
+_NPM_TIMEOUT = 60
 
 _PROBE = Path(__file__).with_name("dsh_contract.mjs")
 
@@ -73,9 +79,33 @@ class ContractReport:
         return not self.failures and self.skipped is None
 
 
+def npm_global_candidates() -> list[Path]:
+    """Ask npm where it installs global packages, and name DSH under each root.
+
+    A failure here is not an error: the caller still has the static candidates,
+    and an explicit ``--dsh-install`` bypasses all of this.
+    """
+    npm = shutil.which("npm")
+    if npm is None:
+        return []
+    try:
+        completed = subprocess.run(
+            [npm, "root", "-g"],
+            capture_output=True,
+            text=True,
+            timeout=_NPM_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    return [Path(line.strip()) / "@deepseek-ai/dsh" for line in completed.stdout.splitlines() if line.strip()]
+
+
 def find_dsh_install(explicit: str | None = None) -> Path | None:
     """Locate an installed DSH package that carries the session backend."""
-    candidates = [Path(explicit)] if explicit else list(_INSTALL_CANDIDATES)
+    candidates = [Path(explicit)] if explicit else [*_INSTALL_CANDIDATES, *npm_global_candidates()]
     for candidate in candidates:
         marker = candidate / "node_modules" / "@deepseek-ai" / "dsh-session-persistence-jsonl"
         if marker.is_dir():

@@ -27,7 +27,7 @@ HEADER: dict[str, object] = {
     "version": 4,
     "id": "session-00000000-0000-0000-0000-000000000001",
     "createdAt": 1791115958273,
-    "cwd": r"E:\Projects\Python\from",
+    "cwd": r"C:\work\python\from",
     "isSeeded": False,
     "delegationDepth": 0,
     "agentPreset": "standard-no-web",
@@ -199,7 +199,7 @@ def test_encode_header_round_trips_non_ascii() -> None:
 def test_replace_header_keeps_body_frames_byte_identical() -> None:
     raw = build(HEADER, '{"seq":1}', '{"seq":2}', '{"seq":3}')
     original = decode_frames(raw, label="t")
-    new_header = {**HEADER, "cwd": r"E:\Projects\Python\to"}
+    new_header = {**HEADER, "cwd": r"C:\work\python\to"}
 
     rewritten, body = replace_header_frame(raw, new_header, label="t")
 

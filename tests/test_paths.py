@@ -1,9 +1,10 @@
 """Tests for DSH's two on-disk encodings.
 
-The vectors are real paths and session ids taken from this machine's session
-library, plus the escape rules transcribed from the shipping implementation. A
-wrong escape here would silently sweep the wrong directory, so these are worth
-pinning exactly.
+A wrong escape here would silently sweep the wrong directory, so the expected
+values are pinned exactly. They are not hand-derived from the documented rule:
+each one was produced by slicing ``projectKey`` and ``encodeSegment`` out of the
+built DSH file and evaluating them, so the suite asserts DSH's answers rather
+than this project's reading of DSH's code.
 """
 
 from __future__ import annotations
@@ -12,14 +13,16 @@ import pytest
 
 from dsh_session_tools.paths import encode_segment, project_dir, project_key, session_dir
 
-# (cwd, project directory name) pairs observed in a real ~/.dsh/sessions tree.
+# (cwd, project directory name) pairs covering the shapes a real library holds: a
+# drive letter, a UNC path, mixed case, dashes and underscores.
 PROJECT_VECTORS: list[tuple[str, str]] = [
-    (r"E:\MyWorkspace\hello-sunnysport", "--E-MyWorkspace-hello-sunnysport--"),
-    (r"E:\Projects\Android\BiliRoamingX", "--E-Projects-Android-BiliRoamingX--"),
-    (r"E:\Projects\Android\EndfieldChargingAnim", "--E-Projects-Android-EndfieldChargingAnim--"),
-    (r"E:\Projects\Python\UniversalWorkspace", "--E-Projects-Python-UniversalWorkspace--"),
-    (r"E:\Projects\Python\lemony_rhythmgame_workspace", "--E-Projects-Python-lemony_rhythmgame_workspace--"),
-    (r"\\wsl.localhost\Debian\home\lemon\swaptube", "--wsl.localhost-Debian-home-lemon-swaptube--"),
+    (r"C:\work\plain-project", "--C-work-plain-project--"),
+    (r"C:\work\apps\SampleTool", "--C-work-apps-SampleTool--"),
+    (r"C:\work\apps\LongComponentName", "--C-work-apps-LongComponentName--"),
+    (r"C:\work\python\SampleWorkspace", "--C-work-python-SampleWorkspace--"),
+    (r"C:\work\python\under_scored_name", "--C-work-python-under_scored_name--"),
+    (r"\\wsl.localhost\Ubuntu\home\user\project", "--wsl.localhost-Ubuntu-home-user-project--"),
+    (r"D:\work\python\sample-workspace", "--D-work-python-sample-workspace--"),
 ]
 
 
@@ -60,11 +63,12 @@ def test_project_key_honours_fs_component_limit() -> None:
 
 
 def test_encode_segment_passes_safe_ids_through() -> None:
-    # Every id in a real library looks like this.
+    # The two id shapes a library holds: a bare UUID, and one with the session-
+    # prefix DSH adds for its own sessions.
     for session_id in (
-        "session-a5864bb4-04f5-4fb5-9ee4-becb0a7b5e22",
-        "32ba2b7f-d352-4c2c-9dbd-a2edc7e09793",
-        "263befcb-6843-4fdd-8175-8195c99caf56",
+        "session-01234567-89ab-4cde-8f01-23456789abcd",
+        "01234567-89ab-4cde-8f01-23456789abcd",
+        "fedcba98-7654-4321-0fed-cba987654321",
         "session.1_a-b",
     ):
         assert encode_segment(session_id) == session_id
