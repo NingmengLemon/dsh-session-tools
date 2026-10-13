@@ -49,6 +49,21 @@ def title_event(title: str, *, seq: int) -> str:
     return json.dumps(event, separators=(",", ":"))
 
 
+@pytest.fixture(autouse=True)
+def title_cache_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep the title cache inside the test's own temporary directory.
+
+    Every command that shows or matches a title writes a cache entry. Without
+    this, the suite leaves one cache file per distinct sessions root in the
+    developer's real cache directory, which is pollution and also a way for one
+    test to answer from another test's data.
+    """
+    target = tmp_path_factory.mktemp("title-cache")
+    monkeypatch.setenv("LOCALAPPDATA", str(target))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(target))
+    return target
+
+
 class FakeHome:
     """A temporary DSH home plus helpers for populating it."""
 

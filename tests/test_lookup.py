@@ -12,6 +12,7 @@ from conftest import FakeHome, title_event
 from dsh_session_tools.cli import _find_session, main
 from dsh_session_tools.errors import ToolError
 from dsh_session_tools.sessions import scan_sessions
+from dsh_session_tools.titles import TitleReader
 
 FIRST = "session-11111111-aaaa-4aaa-8aaa-000000000001"
 SECOND = "session-22222222-bbbb-4bbb-8bbb-000000000002"
@@ -34,26 +35,26 @@ def _populate(home: FakeHome) -> str:
 def test_an_exact_id_selects_its_session(home: FakeHome) -> None:
     _populate(home)
     scan = scan_sessions(home.sessions_root)
-    assert _find_session(scan, FIRST).session_id == FIRST
+    assert _find_session(scan, FIRST, TitleReader()).session_id == FIRST
 
 
 def test_a_unique_id_prefix_selects_its_session(home: FakeHome) -> None:
     _populate(home)
     scan = scan_sessions(home.sessions_root)
-    assert _find_session(scan, "session-22222222").session_id == SECOND
+    assert _find_session(scan, "session-22222222", TitleReader()).session_id == SECOND
 
 
 def test_a_title_fragment_selects_its_session_ignoring_case(home: FakeHome) -> None:
     _populate(home)
     scan = scan_sessions(home.sessions_root)
-    assert _find_session(scan, "LEXER").session_id == SECOND
+    assert _find_session(scan, "LEXER", TitleReader()).session_id == SECOND
 
 
 def test_an_ambiguous_title_is_refused_with_the_candidates(home: FakeHome) -> None:
     _populate(home)
     scan = scan_sessions(home.sessions_root)
     with pytest.raises(ToolError) as caught:
-        _find_session(scan, "parser")
+        _find_session(scan, "parser", TitleReader())
     message = str(caught.value)
     assert "matches 2 sessions" in message
     assert FIRST in message
@@ -64,14 +65,14 @@ def test_an_unknown_selector_is_refused(home: FakeHome) -> None:
     _populate(home)
     scan = scan_sessions(home.sessions_root)
     with pytest.raises(ToolError, match="session not found"):
-        _find_session(scan, "no-such-session")
+        _find_session(scan, "no-such-session", TitleReader())
 
 
 def test_an_empty_selector_is_refused(home: FakeHome) -> None:
     _populate(home)
     scan = scan_sessions(home.sessions_root)
     with pytest.raises(ToolError, match="empty"):
-        _find_session(scan, "")
+        _find_session(scan, "", TitleReader())
 
 
 def test_a_title_match_does_not_hide_an_exact_id(home: FakeHome) -> None:
@@ -85,7 +86,7 @@ def test_a_title_match_does_not_hide_an_exact_id(home: FakeHome) -> None:
         ],
     )
     scan = scan_sessions(home.sessions_root)
-    assert _find_session(scan, FIRST).session_id == FIRST
+    assert _find_session(scan, FIRST, TitleReader()).session_id == FIRST
 
 
 def test_a_session_with_an_unreadable_log_does_not_block_a_title_match(home: FakeHome) -> None:
@@ -95,13 +96,13 @@ def test_a_session_with_an_unreadable_log_does_not_block_a_title_match(home: Fak
     raw[-1] ^= 0xFF
     broken.write_bytes(bytes(raw))
     scan = scan_sessions(home.sessions_root)
-    assert _find_session(scan, "lexer").session_id == SECOND
+    assert _find_session(scan, "lexer", TitleReader()).session_id == SECOND
 
 
 def test_created_at_reads_the_header_epoch_milliseconds(home: FakeHome) -> None:
     _populate(home)
     scan = scan_sessions(home.sessions_root)
-    session = _find_session(scan, FIRST)
+    session = _find_session(scan, FIRST, TitleReader())
     assert session.created_at is not None
     assert session.created_at.timestamp() == EARLY / 1000
 
@@ -111,8 +112,8 @@ def test_created_at_is_none_for_a_missing_or_absurd_value(home: FakeHome) -> Non
     home.session(session_id=FIRST, cwd=alpha, extra_headers={"createdAt": "yesterday"})
     home.session(session_id=SECOND, cwd=alpha, extra_headers={"createdAt": 10**30})
     scan = scan_sessions(home.sessions_root)
-    assert _find_session(scan, FIRST).created_at is None
-    assert _find_session(scan, SECOND).created_at is None
+    assert _find_session(scan, FIRST, TitleReader()).created_at is None
+    assert _find_session(scan, SECOND, TitleReader()).created_at is None
 
 
 def test_list_shows_the_creation_time_and_puts_the_newest_first(

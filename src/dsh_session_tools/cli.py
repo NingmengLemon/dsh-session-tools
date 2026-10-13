@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from time import time_ns
 
+from .cache import TitleCache, default_cache_path
 from .config import Config
 from .contract import check, self_test
 from .errors import ToolError, quote
@@ -28,7 +29,7 @@ from .operations import (
 )
 from .paths import encode_segment, project_key
 from .sessions import ScanResult, Session, parse_generation, scan_sessions
-from .titles import one_line, session_title
+from .titles import TitleReader
 from .workspaces import (
     Registry,
     Workspace,
@@ -58,16 +59,6 @@ def _short(text: str, width: int = 46) -> str:
     return text if len(text) <= width else text[: width - 1] + "\u2026"
 
 
-def _read_title(session: Session) -> str | None:
-    """The session's title as DSH folds it from the log, or ``None`` if untitled.
-
-    DSH keeps a title as a ``session/title`` event in the log, not in the header
-    (see :mod:`.titles`). Raises when the log cannot be read.
-    """
-    artifacts = session.artifacts()
-    return session_title(artifacts[0]) if artifacts else None
-
-
 def _created_key(session: Session) -> float:
     """Sort key for creation time; sessions with no readable time sort last."""
     created = session.created_at
@@ -77,21 +68,6 @@ def _created_key(session: Session) -> float:
 def _stamp(session: Session) -> str:
     created = session.created_at
     return created.strftime("%Y-%m-%d %H:%M UTC") if created is not None else "(no time)"
-
-
-def _display_title(session: Session) -> str:
-    """The label a person scans for: the session's title, or a stated placeholder.
-
-    A log that cannot be read says so, rather than presenting the session as
-    untitled.
-    """
-    try:
-        title = _read_title(session)
-    except (ArtifactError, OSError):
-        return "(title unreadable)"
-    if title is None:
-        return "(untitled)"
-    return one_line(title) or "(untitled)"
 
 
 # --- host process detection ---------------------------------------------------
@@ -146,7 +122,14 @@ def _load(config: Config) -> tuple[Registry, ScanResult]:
     return registry, scan_sessions(config.sessions_root)
 
 
-def _find_session(scan: ScanResult, selector: str) -> Session:
+def _open_titles(args: argparse.Namespace, config: Config) -> TitleReader:
+    """A title reader backed by the on-disk cache, unless caching was turned off."""
+    if getattr(args, "no_cache", False):
+        return TitleReader()
+    return TitleReader(TitleCache.load(default_cache_path(config.sessions_root)))
+
+
+def _find_session(scan: ScanResult, selector: str, titles: TitleReader) -> Session:
     """Resolve one session from an exact id, an id prefix, or part of its title.
 
     The stages run in that order and the first one with any match decides, so an
@@ -157,17 +140,17 @@ def _find_session(scan: ScanResult, selector: str) -> Session:
         raise ToolError("the session selector is empty")
     exact = scan.by_id(selector)
     if exact:
-        return _unique(selector, exact)
+        return _unique(selector, exact, titles)
     by_prefix = [session for session in scan.sessions if session.session_id.startswith(selector)]
     if by_prefix:
-        return _unique(selector, by_prefix)
-    by_title = [session for session in scan.sessions if _title_matches(session, selector)]
+        return _unique(selector, by_prefix, titles)
+    by_title = [session for session in scan.sessions if titles.matches(session, selector)]
     if by_title:
-        return _unique(selector, by_title)
+        return _unique(selector, by_title, titles)
     raise ToolError(f"session not found: {selector}")
 
 
-def _unique(selector: str, matches: list[Session] | tuple[Session, ...]) -> Session:
+def _unique(selector: str, matches: list[Session] | tuple[Session, ...], titles: TitleReader) -> Session:
     """Return the one session ``matches`` names, or refuse and list the candidates."""
     ids = {match.session_id for match in matches}
     if len(ids) == 1:
@@ -175,24 +158,11 @@ def _unique(selector: str, matches: list[Session] | tuple[Session, ...]) -> Sess
             return matches[0]
         locations = ", ".join(str(match.directory) for match in matches)
         raise ToolError(f"session id appears in {len(matches)} directories: {locations}")
-    shown = "\n".join(f"  {match.session_id}  {_display_title(match)}" for match in matches[:20])
+    shown = "\n".join(f"  {match.session_id}  {titles.display(match)}" for match in matches[:20])
     more = f"\n  ... and {len(matches) - 20} more" if len(matches) > 20 else ""
     raise ToolError(
         f"{quote(selector)} matches {len(ids)} sessions; give a longer id or title:\n{shown}{more}"
     )
-
-
-def _title_matches(session: Session, needle: str) -> bool:
-    """Whether the session's title contains ``needle``, ignoring case.
-
-    A log that cannot be read simply does not match, so one damaged session never
-    blocks finding another. ``list`` is where damage is reported.
-    """
-    try:
-        title = _read_title(session)
-    except (ArtifactError, OSError):
-        return False
-    return title is not None and needle.casefold() in title.casefold()
 
 
 def _resolve_target(registry: Registry, raw: str) -> Workspace:
@@ -247,6 +217,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     """Group sessions by their stored cwd, and show which workspace that is."""
     config = Config.resolve(args.dsh_home)
     registry, scan = _load(config)
+    titles = _open_titles(args, config)
 
     grouped: dict[str, list[Session]] = {}
     for session in scan.sessions:
@@ -261,7 +232,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             print(f"{len(sessions)} session(s) stored under {cwd}")
             print(f"  workspace: {workspace.title if workspace else 'NOT REGISTERED'}")
             print()
-            labels = {session.directory: _display_title(session) for session in sessions}
+            labels = {session.directory: titles.display(session) for session in sessions}
             newest_first = sorted(sessions, key=_created_key, reverse=True)
             for session in newest_first:
                 artifacts = session.artifacts()
@@ -278,6 +249,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 suffix = f"   [{', '.join(marks)}]" if marks else ""
                 print(f"  {_short(labels[session.directory], 72)}{suffix}")
                 print(f"      {session.session_id}   created {_stamp(session)}")
+            titles.save()
             return 0
         print(f"no sessions stored under {args.from_path}")
         return 1
@@ -306,6 +278,54 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_find(args: argparse.Namespace) -> int:
+    """Search session titles across the library.
+
+    Titles live in the logs, so every searched session is read once and the answer
+    is remembered for next time (see :mod:`.cache`). Subagent sessions are skipped
+    unless ``--all`` is given: DSH nests them under their parent, and a library
+    usually holds several times more of them than sessions a person started.
+    """
+    config = Config.resolve(args.dsh_home)
+    registry, scan = _load(config)
+    titles = _open_titles(args, config)
+
+    wanted = canonical(args.from_path) if args.from_path else None
+    found: list[Session] = []
+    searched = 0
+    for session in scan.sessions:
+        if session.is_subagent and not args.all:
+            continue
+        if wanted is not None and canonical(session.cwd or "") != wanted:
+            continue
+        searched += 1
+        if titles.matches(session, args.query):
+            found.append(session)
+    titles.save()
+
+    if not found:
+        scope = "every session" if args.all else "every top-level session"
+        print(f"no title contains {quote(args.query)}; searched {scope} ({searched} of {len(scan.sessions)})")
+        return 1
+
+    found.sort(key=_created_key, reverse=True)
+    print(f"{len(found)} session(s) match {quote(args.query)} (of {searched} searched)\n")
+    for session in found[: args.limit]:
+        workspace = registry.resolve_cwd(session.cwd or "")
+        marks = []
+        if registry.is_archived(session.session_id):
+            marks.append("archived")
+        if session.is_subagent:
+            marks.append("subagent")
+        suffix = f"   [{', '.join(marks)}]" if marks else ""
+        print(f"  {_short(titles.display(session), 72)}{suffix}")
+        print(f"      {session.session_id}   created {_stamp(session)}")
+        print(f"      {session.cwd}   [{workspace.title if workspace else 'NOT REGISTERED'}]")
+    if len(found) > args.limit:
+        print(f"\n  ... and {len(found) - args.limit} more; raise --limit to see them")
+    return 0
+
+
 def cmd_move(args: argparse.Namespace) -> int:
     """Move one session to another workspace.
 
@@ -316,7 +336,9 @@ def cmd_move(args: argparse.Namespace) -> int:
     """
     config = Config.resolve(args.dsh_home)
     registry, scan = _load(config)
-    session = _find_session(scan, args.session)
+    titles = _open_titles(args, config)
+    session = _find_session(scan, args.session, titles)
+    titles.save()
     target = _resolve_target(registry, args.to)
 
     outcome = plan_move(
@@ -646,6 +668,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="DSH home directory (default: $DSH_HOME, else ~/.dsh)",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="read session titles from the logs every time instead of using the cache",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     verify = subparsers.add_parser("verify", help="check every artifact decodes frame-by-frame")
@@ -654,6 +681,15 @@ def build_parser() -> argparse.ArgumentParser:
     listing = subparsers.add_parser("list", help="group sessions by stored cwd")
     listing.add_argument("--from", dest="from_path", metavar="PATH", help="list one cwd group in detail")
     listing.set_defaults(func=cmd_list)
+
+    finding = subparsers.add_parser("find", help="search session titles")
+    finding.add_argument("query", metavar="TEXT", help="text to look for in a title")
+    finding.add_argument(
+        "--from", dest="from_path", metavar="PATH", help="only search sessions stored under this cwd"
+    )
+    finding.add_argument("--all", action="store_true", help="include subagent sessions")
+    finding.add_argument("--limit", type=int, default=40, metavar="N", help="show at most N matches")
+    finding.set_defaults(func=cmd_find)
 
     move = subparsers.add_parser("move", help="move a session to another workspace")
     move.add_argument("--session", required=True, metavar="ID", help="session id to move")

@@ -119,12 +119,17 @@ uv run dsh-sessions verify
 uv run dsh-sessions list
 uv run dsh-sessions list --from "D:\work\my-project"
 
-# 5. See what a move would do. Nothing is written. --session takes a full id, a
+# 5. Search titles across the library. Subagents are skipped unless --all is
+#    given, since DSH nests them under their parent.
+uv run dsh-sessions find <text>
+uv run dsh-sessions find <text> --from "D:\work\my-project" --all --limit 60
+
+# 6. See what a move would do. Nothing is written. --session takes a full id, a
 #    unique id prefix, or a fragment of the title; an ambiguous one is refused and
 #    lists the candidates.
 uv run dsh-sessions move --session <id-or-title> --to "<target workspace path>" --dry-run
 
-# 6. Do it. Refuses while a DSH process is running unless --force.
+# 7. Do it. Refuses while a DSH process is running unless --force.
 uv run dsh-sessions move --session <id-or-title> --to "<target workspace path>"
 
 # Undo one artifact from its backup.
@@ -200,6 +205,7 @@ src/dsh_session_tools/
   sessions.py        discovery under <dshHome>/sessions
   workspaces.py      the workspace registry: read it, and move ownership in it
   titles.py          session titles, read from the log's session/title events
+  cache.py           remembered titles, keyed by artifact size and mtime
   operations.py      plan a move, apply it, verify it
   contract.py        check this tool's view against the installed DSH
   dsh_contract.mjs   the node side of that check, driving the real backend
@@ -255,6 +261,14 @@ Read this before trusting it with a library you care about.
   sessions this way took about 2.3 seconds on this machine. A plain `list`
   reads headers only and pays nothing for titles. Selecting a session by title
   reads logs too, but only after the id stages find nothing.
+* **Searching titles reads every log once, then remembers the answers.** The
+  cache lives under the platform cache directory (`%LOCALAPPDATA%`,
+  `~/Library/Caches`, `$XDG_CACHE_HOME`), in a file named after a hash of the
+  sessions root, and an entry is trusted only while the artifact's size and
+  modification time are unchanged. On the development library a cold `find` over
+  68 top-level sessions took about 13 seconds and the warm one 0.8 seconds.
+  `--no-cache` skips it entirely, and a cache that cannot be read or written is
+  treated as empty rather than failing the command.
 * **Creation time comes from the header** (`createdAt`, epoch milliseconds). A
   value that is missing or out of range shows as `(no time)` and sorts last.
 * **Six artifacts in the development library are listed by DSH but will not
