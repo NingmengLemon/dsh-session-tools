@@ -39,6 +39,16 @@ def write_artifact(
     return path
 
 
+def title_event(title: str, *, seq: int) -> str:
+    """One `session/title` event line, shaped the way DSH appends it."""
+    event = {
+        "seq": seq,
+        "type": "session/title",
+        "data": {"title": title, "messageSeqs": [], "source": {"kind": "user"}},
+    }
+    return json.dumps(event, separators=(",", ":"))
+
+
 class FakeHome:
     """A temporary DSH home plus helpers for populating it."""
 
@@ -81,19 +91,22 @@ class FakeHome:
             "agentPreset": "standard-no-web",
             "cwd": cwd,
         }
-        if title is not None:
-            header["title"] = title
         if origin is not None:
             header["origin"] = origin
         if extra_headers:
             header.update(extra_headers)
+
+        body = lines if lines is not None else ['{"seq":1,"type":"turn/start"}']
+        if title is not None:
+            # DSH keeps a title as a session/title event in the log, never in the header.
+            body = [*body, title_event(title, seq=len(body) + 2)]
 
         directory = self.sessions_root / project_key(cwd) / encode_segment(session_id)
         return write_artifact(
             directory,
             filename=filename or f"session.v{version}.jsonl.zstd",
             header=header,
-            lines=lines if lines is not None else ['{"seq":1,"type":"turn/start"}'],
+            lines=body,
         )
 
     def write_registry(

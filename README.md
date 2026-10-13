@@ -103,7 +103,8 @@ uv run dsh-sessions contract --self-test
 # 3. Verify every artifact decodes frame-by-frame and every line is JSON.
 uv run dsh-sessions verify
 
-# 4. List the registry and every cwd group.
+# 4. List the registry and every cwd group. `--from` shows each session's title,
+#    read from its log, with the id beneath it.
 uv run dsh-sessions list
 uv run dsh-sessions list --from "E:\Projects\Python\UniversalWorkspace"
 
@@ -171,6 +172,7 @@ src/dsh_session_tools/
   paths.py           DSH's two on-disk encodings (projectKey, encodeSegment)
   sessions.py        discovery under <dshHome>/sessions
   workspaces.py      the workspace registry document, and path canonicalisation
+  titles.py          session titles, read from the log's session/title events
   operations.py      plan a move, apply it, verify it
   contract.py        check this tool's view against the installed DSH
   dsh_contract.mjs   the node side of that check, driving the real backend
@@ -213,6 +215,11 @@ Read this before trusting it with a library you care about.
   measured rather than estimated: 233 session directories, 108 of which hold
   several retained generations, 349 artifacts, 601 MiB compressed, 318,632
   frames.
+* **Titles cost a full read of the listed session.** DSH keeps a title as a
+  `session/title` event in the log, not in the header, so `list --from` decodes
+  each listed session's current artifact to find the last one. Listing 54
+  sessions this way took about 2.3 seconds on this machine. A plain `list`
+  reads headers only and pays nothing for titles.
 * **Six artifacts in the development library are listed by DSH but will not
   open**, as v0 logs whose descriptor version it no longer supports. They predate
   this tool; `contract` reports them separately so a real divergence is not

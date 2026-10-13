@@ -26,6 +26,7 @@ from .operations import (
 )
 from .paths import encode_segment, project_key
 from .sessions import ScanResult, Session, parse_generation, scan_sessions
+from .titles import one_line, session_title
 from .workspaces import Registry, Workspace, canonical, load_registry
 
 _PROGRAM = "dsh-sessions"
@@ -47,14 +48,21 @@ def _short(text: str, width: int = 46) -> str:
     return text if len(text) <= width else text[: width - 1] + "\u2026"
 
 
-def _headline(session: Session) -> str:
-    """Best available human label for a session.
+def _display_title(session: Session) -> str:
+    """The label a person scans for: the session's title, or a stated placeholder.
 
-    DSH derives a display title from the first prompt and stores it durably in
-    the header once it exists. A session that never got one is shown by id.
+    DSH keeps a title as a ``session/title`` event in the log, not in the header,
+    so reading it means reading the log (see :mod:`.titles`). A log that cannot be
+    read says so, rather than presenting the session as untitled.
     """
-    title = session.header.get("title")
-    return title if isinstance(title, str) and title else session.session_id
+    artifacts = session.artifacts()
+    try:
+        title = session_title(artifacts[0]) if artifacts else None
+    except (ArtifactError, OSError):
+        return "(title unreadable)"
+    if title is None:
+        return "(untitled)"
+    return one_line(title) or "(untitled)"
 
 
 # --- host process detection ---------------------------------------------------
@@ -185,7 +193,8 @@ def cmd_list(args: argparse.Namespace) -> int:
             print(f"{len(sessions)} session(s) stored under {cwd}")
             print(f"  workspace: {workspace.title if workspace else 'NOT REGISTERED'}")
             print()
-            for session in sorted(sessions, key=_headline):
+            labels = {session.directory: _display_title(session) for session in sessions}
+            for session in sorted(sessions, key=lambda item: labels[item.directory].casefold()):
                 artifacts = session.artifacts()
                 flagged = describe_mismatch(session)
                 marks = []
@@ -198,8 +207,8 @@ def cmd_list(args: argparse.Namespace) -> int:
                 if flagged:
                     marks.append(f"MISMATCH: {flagged}")
                 suffix = f"   [{', '.join(marks)}]" if marks else ""
-                print(f"  {session.session_id}")
-                print(f"      {_short(_headline(session))}{suffix}")
+                print(f"  {_short(labels[session.directory], 72)}{suffix}")
+                print(f"      {session.session_id}")
             return 0
         print(f"no sessions stored under {args.from_path}")
         return 1
