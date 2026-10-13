@@ -124,12 +124,21 @@ uv run dsh-sessions list --from "D:\work\my-project"
 uv run dsh-sessions find <text>
 uv run dsh-sessions find <text> --from "D:\work\my-project" --all --limit 60
 
-# 6. See what a move would do. Nothing is written. --session takes a full id, a
+# 6. Everything known about one session: title, creation time, workspace,
+#    directory, flags, and each artifact with its frame count. `show --json` and
+#    `list --json` emit the same record shape.
+uv run dsh-sessions show <id-or-title>
+
+# 7. Machine-readable: every session as an object, newest first, honouring
+#    --from. This reads titles, so it is the slow one on a cold cache.
+uv run dsh-sessions list --json
+
+# 8. See what a move would do. Nothing is written. --session takes a full id, a
 #    unique id prefix, or a fragment of the title; an ambiguous one is refused and
 #    lists the candidates.
 uv run dsh-sessions move --session <id-or-title> --to "<target workspace path>" --dry-run
 
-# 7. Do it. Refuses while a DSH process is running unless --force.
+# 9. Do it. Refuses while a DSH process is running unless --force.
 uv run dsh-sessions move --session <id-or-title> --to "<target workspace path>"
 
 # Undo one artifact from its backup.

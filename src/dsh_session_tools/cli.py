@@ -7,6 +7,7 @@ back up before they write. ``move`` previews with ``--dry-run``.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ from .cache import TitleCache, default_cache_path
 from .config import Config
 from .contract import check, self_test
 from .errors import ToolError, quote
-from .frames import ArtifactError, decode_frames, decode_header
+from .frames import ArtifactError, decode_frames, decode_header, scan_frames
 from .operations import (
     BACKUP_MARKER,
     MoveFailure,
@@ -68,6 +69,75 @@ def _created_key(session: Session) -> float:
 def _stamp(session: Session) -> str:
     created = session.created_at
     return created.strftime("%Y-%m-%d %H:%M UTC") if created is not None else "(no time)"
+
+
+def _iso(session: Session) -> str | None:
+    """The creation time as an ISO 8601 UTC stamp, to millisecond precision."""
+    created = session.created_at
+    if created is None:
+        return None
+    return created.strftime("%Y-%m-%dT%H:%M:%S.") + f"{created.microsecond // 1000:03d}Z"
+
+
+def _session_record(
+    session: Session,
+    registry: Registry,
+    titles: TitleReader | None = None,
+    *,
+    with_frames: bool = False,
+) -> dict[str, object]:
+    """One session as a JSON-safe object, shared by ``list --json`` and ``show``.
+
+    ``with_frames`` is off by default because counting frames means reading every
+    artifact, which is affordable for one session and not for a library.
+    """
+    artifacts = session.artifacts()
+    workspace = registry.resolve_cwd(session.cwd or "")
+    rows: list[dict[str, object]] = []
+    for artifact in artifacts:
+        try:
+            size: int | None = artifact.path.stat().st_size
+        except OSError:
+            size = None
+        row: dict[str, object] = {
+            "filename": artifact.filename,
+            "version": artifact.version,
+            "compressed": artifact.compressed,
+            "bytes": size,
+        }
+        if with_frames:
+            try:
+                row["frames"] = len(scan_frames(artifact.path.read_bytes()))
+            except (ArtifactError, OSError) as error:
+                row["frames"] = None
+                row["frames_error"] = str(error)
+        rows.append(row)
+
+    title: str | None = None
+    if titles is not None:
+        try:
+            title = titles.title(session)
+        except (ArtifactError, OSError):
+            title = None
+
+    return {
+        "id": session.session_id,
+        "title": title,
+        "cwd": session.cwd,
+        "created": _iso(session),
+        "directory": str(session.directory),
+        "workspace": (
+            {"id": workspace.workspace_id, "title": workspace.title, "path": workspace.path}
+            if workspace is not None
+            else None
+        ),
+        "artifacts": rows,
+        "generations": len(artifacts),
+        "archived": registry.is_archived(session.session_id),
+        "subagent": session.is_subagent,
+        "directory_mismatch": describe_mismatch(session),
+        "shown_in_no_workspace": describe_invisible(session, registry),
+    }
 
 
 # --- host process detection ---------------------------------------------------
@@ -219,6 +289,24 @@ def cmd_list(args: argparse.Namespace) -> int:
     registry, scan = _load(config)
     titles = _open_titles(args, config)
 
+    if args.json:
+        wanted = canonical(args.from_path) if args.from_path else None
+        selected = [
+            session for session in scan.sessions if wanted is None or canonical(session.cwd or "") == wanted
+        ]
+        selected.sort(key=_created_key, reverse=True)
+        print(
+            json.dumps(
+                [_session_record(session, registry, titles) for session in selected],
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        titles.save()
+        if not selected and args.from_path:
+            return 1
+        return 0
+
     grouped: dict[str, list[Session]] = {}
     for session in scan.sessions:
         grouped.setdefault(session.cwd or "(no cwd)", []).append(session)
@@ -323,6 +411,59 @@ def cmd_find(args: argparse.Namespace) -> int:
         print(f"      {session.cwd}   [{workspace.title if workspace else 'NOT REGISTERED'}]")
     if len(found) > args.limit:
         print(f"\n  ... and {len(found) - args.limit} more; raise --limit to see them")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """Print everything known about one session, by id, id prefix or title."""
+    config = Config.resolve(args.dsh_home)
+    registry, scan = _load(config)
+    titles = _open_titles(args, config)
+    session = _find_session(scan, args.session, titles)
+
+    if args.json:
+        print(
+            json.dumps(
+                _session_record(session, registry, titles, with_frames=True),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        titles.save()
+        return 0
+
+    artifacts = session.artifacts()
+    workspace = registry.resolve_cwd(session.cwd or "")
+    print(f"session    : {session.session_id}")
+    print(f"title      : {titles.display(session)}")
+    print(f"created    : {_stamp(session)}")
+    print(f"cwd        : {session.cwd}   [{workspace.title if workspace else 'NOT REGISTERED'}]")
+    print(f"directory  : {session.directory}")
+    flags = []
+    if registry.is_archived(session.session_id):
+        flags.append("archived")
+    if session.is_subagent:
+        flags.append("subagent")
+    print(f"flags      : {', '.join(flags) if flags else 'none'}")
+    print(f"generations: {len(artifacts)}")
+    for artifact in artifacts:
+        try:
+            size = _human_bytes(artifact.path.stat().st_size)
+        except OSError:
+            size = "unreadable"
+        try:
+            frames = f", {len(scan_frames(artifact.path.read_bytes()))} frames"
+        except (ArtifactError, OSError) as error:
+            frames = f", frames unreadable: {error}"
+        print(f"  {artifact.filename}  v{artifact.version}  {size}{frames}")
+    titles.save()
+
+    problem = describe_mismatch(session)
+    if problem:
+        print(f"\nmismatch   : {problem}")
+    invisible = describe_invisible(session, registry)
+    if invisible:
+        print(f"not shown  : {invisible}")
     return 0
 
 
@@ -680,7 +821,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = subparsers.add_parser("list", help="group sessions by stored cwd")
     listing.add_argument("--from", dest="from_path", metavar="PATH", help="list one cwd group in detail")
+    listing.add_argument(
+        "--json",
+        action="store_true",
+        help="emit every session as JSON (reads titles from the logs; honours --from)",
+    )
     listing.set_defaults(func=cmd_list)
+
+    showing = subparsers.add_parser("show", help="show everything known about one session")
+    showing.add_argument("session", metavar="ID", help="full id, unique id prefix, or title fragment")
+    showing.add_argument("--json", action="store_true", help="emit the record as JSON")
+    showing.set_defaults(func=cmd_show)
 
     finding = subparsers.add_parser("find", help="search session titles")
     finding.add_argument("query", metavar="TEXT", help="text to look for in a title")
