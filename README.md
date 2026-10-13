@@ -261,6 +261,15 @@ Read this before trusting it with a library you care about.
   sessions this way took about 2.3 seconds on this machine. A plain `list`
   reads headers only and pays nothing for titles. Selecting a session by title
   reads logs too, but only after the id stages find nothing.
+* **A short title is DSH's, not this tool's.** DSH stores the title already
+  shortened. Its deterministic fallback keeps the first five whitespace-delimited
+  words of the first prompt within 40 UTF-8 bytes, and the provider path is
+  capped at 80 (`fallbackMaxBytes` and `maxTitleBytes`,
+  `dsh-base/cordis.patch.yml`). The cut lands on a code-point boundary, so a CJK
+  title ends after roughly thirteen characters and never splits one. Measured
+  over 30 top-level sessions: 14 titles came from the provider, 8 from the
+  fallback, 2 from an explicit rename, and 6 sessions had no title event at all.
+  Every title shown here is the stored text verbatim; nothing re-cuts it.
 * **Searching titles reads every log once, then remembers the answers.** The
   cache lives under the platform cache directory (`%LOCALAPPDATA%`,
   `~/Library/Caches`, `$XDG_CACHE_HOME`), in a file named after a hash of the
