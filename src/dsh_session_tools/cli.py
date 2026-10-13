@@ -14,20 +14,30 @@ from time import time_ns
 
 from .config import Config
 from .contract import check, self_test
-from .errors import ToolError
+from .errors import ToolError, quote
 from .frames import ArtifactError, decode_frames, decode_header
 from .operations import (
     BACKUP_MARKER,
     MoveFailure,
     apply_plan,
+    describe_invisible,
     describe_mismatch,
     plan_move,
     verify_move,
+    verify_ownership,
 )
 from .paths import encode_segment, project_key
 from .sessions import ScanResult, Session, parse_generation, scan_sessions
 from .titles import one_line, session_title
-from .workspaces import Registry, Workspace, canonical, load_registry
+from .workspaces import (
+    Registry,
+    Workspace,
+    apply_ownership,
+    canonical,
+    load_registry,
+    plan_ownership,
+    reclaim_registry_backup,
+)
 
 _PROGRAM = "dsh-sessions"
 
@@ -167,7 +177,9 @@ def _unique(selector: str, matches: list[Session] | tuple[Session, ...]) -> Sess
         raise ToolError(f"session id appears in {len(matches)} directories: {locations}")
     shown = "\n".join(f"  {match.session_id}  {_display_title(match)}" for match in matches[:20])
     more = f"\n  ... and {len(matches) - 20} more" if len(matches) > 20 else ""
-    raise ToolError(f"{selector!r} matches {len(ids)} sessions; give a longer id or title:\n{shown}{more}")
+    raise ToolError(
+        f"{quote(selector)} matches {len(ids)} sessions; give a longer id or title:\n{shown}{more}"
+    )
 
 
 def _title_matches(session: Session, needle: str) -> bool:
@@ -326,6 +338,7 @@ def cmd_move(args: argparse.Namespace) -> int:
     source = outcome.source
     print(f"cwd       : {session.cwd}   [{source.title if source else 'not a registered workspace'}]")
     print(f"target    : {target.path}   [{target.title}]")
+    print(f"registry  : {outcome.ownership.describe()}")
     if outcome.relocates:
         print(f"relocate  : {outcome.source_directory.parent.name} -> {outcome.target_directory.parent.name}")
     print()
@@ -340,7 +353,8 @@ def cmd_move(args: argparse.Namespace) -> int:
             )
 
     if outcome.is_noop:
-        print("\nnothing to do - the session already belongs to that workspace")
+        print("\nnothing to do - the artifacts are in place and the workspace registry")
+        print("already accounts for this session under that workspace")
         return 0
 
     if args.dry_run:
@@ -360,8 +374,14 @@ def cmd_move(args: argparse.Namespace) -> int:
             print(f"  backed up: {change.backup}")
 
     directory = verify_move(session, target)
+    verify_ownership(config.dsh_home, session.session_id, target)
+    if not args.keep_backups:
+        reclaim_registry_backup(applied.ownership.backup)
+
     print(f"\ndone - {session.session_id} is now stored under {target.title}.")
     print(f"       artifact : {directory}")
+    if applied.ownership.changed:
+        print(f"       registry : {outcome.ownership.describe()}")
     print("       start DSH; the session should appear under that workspace.")
 
     leftovers = applied.leftovers
@@ -430,9 +450,10 @@ def cmd_restore(args: argparse.Namespace) -> int:
     if source.stat().st_size == 0:
         raise ToolError(f"refusing: {source} is empty")
 
+    home = source.parent.parent.parent.parent
     artifact_name = source.name.split(BACKUP_MARKER, 1)[0]
     if parse_generation(artifact_name) is None:
-        raise ToolError(f"refusing: {artifact_name!r} is not a canonical artifact name")
+        raise ToolError(f"refusing: {quote(artifact_name)} is not a canonical artifact name")
 
     raw = source.read_bytes()
     try:
@@ -473,6 +494,20 @@ def cmd_restore(args: argparse.Namespace) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(raw)
     source.unlink()
+
+    # The restored bytes belong to the workspace they name, so the ownership list
+    # has to move back with them; leaving it pointing at the newer workspace is the
+    # same invisibility a one-sided move produces.
+    registry = load_registry(home)
+    restored_workspace = registry.find(cwd)
+    if restored_workspace is None:
+        print(f"note: {cwd} is not a registered workspace, so DSH will not list this session")
+    else:
+        edit = plan_ownership(registry, session_id, restored_workspace)
+        if edit.needed:
+            apply_ownership(home, edit)
+            print(f"  registry  {edit.describe()}")
+
     print(f"restored {destination}")
     print(f"  from   {source}  (removed)")
     print(f"  cwd    {cwd}")
@@ -526,6 +561,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         exists = Path(cwd).is_dir()
         print(f"  {count:>4} session(s)  {cwd}   [{'exists' if exists else 'MISSING on disk'}]")
 
+    invisible: list[tuple[Session, str]] = []
+    for session in scan.sessions:
+        reason = describe_invisible(session, registry)
+        if reason is not None:
+            invisible.append((session, reason))
+    print(f"\nnot visible in any workspace  : {len(invisible)}")
+    for session, reason in invisible[:20]:
+        print(f"  {session.session_id}: {reason}")
+    if len(invisible) > 20:
+        print(f"  ... and {len(invisible) - 20} more")
+
     archived = sum(1 for session in scan.sessions if registry.is_archived(session.session_id))
     print(f"\narchived sessions           : {archived}")
     print(f"archived ids with no session: {len(registry.archived_session_ids) - archived}")
@@ -555,6 +601,21 @@ def cmd_contract(args: argparse.Namespace) -> int:
     print(f"\nfailures           : {len(report.failures)}")
     for message in report.failures:
         print(f"  ! {message}")
+
+    if report.notes:
+        print("\nnotes:")
+        for message in report.notes:
+            print(f"  ? {message}")
+
+    if report.invisible:
+        print(
+            f"\nlisted by DSH but shown in no workspace ({len(report.invisible)}); DSH logs a "
+            "warning for each and this tool can move them once their ownership is repaired:"
+        )
+        for session_id in report.invisible[:10]:
+            print(f"  ? {session_id}")
+        if len(report.invisible) > 10:
+            print(f"  ? ... and {len(report.invisible) - 10} more")
 
     if report.pre_existing:
         print(f"\nalready unopenable in this store ({len(report.pre_existing)}), not caused by this tool:")

@@ -23,10 +23,10 @@ names, *and* rewrite the header to that ``cwd``. Neither half is sufficient. The
 tool used to do only the second, which is why this module now refuses a session
 whose header and location already disagree, instead of quietly adding one more.
 
-Why the registry is still not edited
-------------------------------------
-A workspace's membership comes from each session's own header, re-derived on
-every read::
+Why the registry is edited too
+------------------------------
+A workspace's visible membership is the intersection of two things, and the
+header supplies only one of them::
 
     dsh-workspace/lib/index.js:102-104
         get sessionIds() {
@@ -35,10 +35,16 @@ every read::
         }
 
 ``indexHeader`` (``:872-890``) resolves the header's ``cwd`` with
-``realpathNormalize`` and compares it against the stored workspace path. Since
-that resolution must land exactly on ``record.path``, the ``cwd`` written here is
-the registry's path verbatim, never a canonicalised spelling of it; writing a
-resolved path would leave the session in no workspace at all.
+``realpathNormalize`` and compares it against the stored workspace path, so the
+``cwd`` written here is the registry's path verbatim, never a canonicalised
+spelling of it. But the getter above *filters* the stored ``sessionIds`` list and
+never adds to it: a relocated session whose id is still owned by the old
+workspace is filtered out of that one and absent from the new one, so it appears
+in no workspace at all. Startup does not repair it either, because ``bootstrap``
+adopts only ids that no workspace accounts for (``:784``).
+
+A move therefore maintains the ownership list too, exactly as ``attachSession``
+(``:111-129``) and ``detachSession`` (``:148-153``) do.
 
 Deliberate conservatism
 -----------------------
@@ -59,11 +65,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import time_ns
 
-from .errors import ToolError
+from .errors import ToolError, quote
 from .frames import ArtifactError, decode_header, replace_header_frame, scan_frames
 from .paths import encode_segment, project_key
 from .sessions import Artifact, Session, parse_generation
-from .workspaces import Registry, Workspace
+from .workspaces import (
+    OwnershipEdit,
+    OwnershipResult,
+    Registry,
+    Workspace,
+    apply_ownership,
+    load_registry,
+    plan_ownership,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +100,8 @@ class MovePlan:
     target: Workspace
     source: Workspace | None
     changes: tuple[PlannedChange, ...]
+    ownership: OwnershipEdit
+    registry_home: Path
     source_directory: Path
     target_directory: Path
 
@@ -95,7 +111,13 @@ class MovePlan:
 
     @property
     def is_noop(self) -> bool:
-        return all(change.unchanged for change in self.changes)
+        """Whether neither half of the move has anything to do.
+
+        Correct artifacts with a stale ownership entry is exactly the state a
+        re-run has to repair, so the registry edit counts here; otherwise it
+        would be dismissed as nothing to do.
+        """
+        return all(change.unchanged for change in self.changes) and not self.ownership.needed
 
     @property
     def relocates(self) -> bool:
@@ -127,6 +149,7 @@ class AppliedMove:
     source_directory: Path
     target_directory: Path
     moved: bool
+    ownership: OwnershipResult
     leftovers: tuple[Path, ...]
 
 
@@ -234,7 +257,7 @@ def plan_move(
         return MoveFailure(
             session_id=session.session_id,
             reason=(
-                f"the workspace path {target_path!r} resolves to {unlinked!r}. DSH resolves the "
+                f"the workspace path {quote(target_path)} resolves to {quote(unlinked)}. DSH resolves the "
                 "header cwd and compares it against the workspace path it stored, so a session "
                 "moved here would belong to no workspace. Register the resolved path, or pick a "
                 "workspace that is not reached through a link."
@@ -249,8 +272,8 @@ def plan_move(
         return MoveFailure(
             session_id=session.session_id,
             reason=(
-                f"DSH would call this log corrupt: it sits in {session.project_dir_name!r} "
-                f"but its cwd implies {expected_directory!r}. Nothing was written. "
+                f"DSH would call this log corrupt: it sits in {quote(session.project_dir_name)} "
+                f"but its cwd implies {quote(expected_directory)}. Nothing was written. "
                 "Restore the artifact to the directory its cwd names, or move it with a "
                 "tool that relocates the artifact and the header together."
             ),
@@ -290,16 +313,16 @@ def plan_move(
                 return MoveFailure(
                     session_id=session.session_id,
                     reason=(
-                        f"{artifact.filename} stores cwd {artifact_cwd!r}, matching neither the "
-                        f"session's cwd {stored_cwd!r} nor the target; refusing to guess"
+                        f"{artifact.filename} stores cwd {quote(artifact_cwd)}, matching neither the "
+                        f"session's cwd {quote(stored_cwd)} nor the target; refusing to guess"
                     ),
                 )
         elif artifact_cwd != agreed_cwd:
             return MoveFailure(
                 session_id=session.session_id,
                 reason=(
-                    f"generations disagree: {artifacts[0].filename} says {agreed_cwd!r} while "
-                    f"{artifact.filename} says {artifact_cwd!r}; refusing to guess"
+                    f"generations disagree: {artifacts[0].filename} says {quote(agreed_cwd)} while "
+                    f"{artifact.filename} says {quote(artifact_cwd)}; refusing to guess"
                 ),
             )
 
@@ -339,6 +362,8 @@ def plan_move(
         target=target,
         source=registry.resolve_cwd(stored_cwd),
         changes=tuple(changes),
+        ownership=plan_ownership(registry, session.session_id, target),
+        registry_home=registry.home,
         source_directory=session.directory,
         target_directory=target_directory_for(session.directory, target_path, session.session_id),
     )
@@ -429,12 +454,25 @@ def apply_plan(plan: MovePlan) -> AppliedMove:
     if moved:
         leftovers = _tidy_source(plan)
 
+    # The artifacts are in place before the registry is touched. If this fails the
+    # move is half applied, which re-running the same move repairs, so the error
+    # says that rather than leaving the user to work it out.
+    try:
+        ownership = apply_ownership(plan.registry_home, plan.ownership)
+    except ToolError as error:
+        raise ToolError(
+            f"{plan.session_id}: the artifacts were moved but the workspace registry was not "
+            f"updated, so DSH will not list this session under any workspace yet: {error} "
+            "Re-run the same move to finish it."
+        ) from error
+
     return AppliedMove(
         session_id=plan.session_id,
         changes=tuple(applied),
         source_directory=plan.source_directory,
         target_directory=plan.target_directory,
         moved=moved,
+        ownership=ownership,
         leftovers=leftovers,
     )
 
@@ -511,15 +549,15 @@ def verify_move(session: Session, target: Workspace) -> Path:
     stored = header.get("cwd")
     if stored != target.path:
         raise ToolError(
-            f"{session.session_id}: post-check failed, stored cwd is {stored!r} "
-            f"but {target.path!r} was expected"
+            f"{session.session_id}: post-check failed, stored cwd is {quote(stored)} "
+            f"but {quote(target.path)} was expected"
         )
 
     expected = project_key(target.path)
     if directory.parent.name != expected:
         raise ToolError(
             f"{session.session_id}: post-check failed, the artifact sits in "
-            f"{directory.parent.name!r} but its cwd implies {expected!r}, which DSH treats as a "
+            f"{quote(directory.parent.name)} but its cwd implies {quote(expected)}, which DSH treats as a "
             "corrupt session log"
         )
     return directory
@@ -542,5 +580,84 @@ def describe_mismatch(session: Session) -> str | None:
     except ValueError as error:
         return str(error)
     if expected != session.project_dir_name:
-        return f"lives in {session.project_dir_name!r} but its cwd implies {expected!r}"
+        return f"lives in {quote(session.project_dir_name)} but its cwd implies {quote(expected)}"
     return None
+
+
+def resolved_spelling(path: str) -> str | None:
+    """The path as the filesystem resolves it, or ``None`` when it does not resolve.
+
+    DSH resolves a session's stored ``cwd`` before comparing it to the workspace
+    path it recorded, so the resolved spelling, not the stored one, is what
+    decides membership.
+    """
+    try:
+        return str(Path(path).resolve(strict=True))
+    except OSError:
+        return None
+
+
+def describe_invisible(session: Session, registry: Registry) -> str | None:
+    """Explain why DSH would list this session in no workspace, or return ``None``.
+
+    Visibility needs both halves (``dsh-workspace/lib/index.js:102-104``): the
+    workspace's stored ownership list must name the session, *and* the session's
+    resolved ``cwd`` must equal that workspace's stored path. Either half can be
+    wrong on its own, and the result is a session that exists on disk, opens by
+    id, and appears in no workspace, which DSH reports as a warning only
+    (``reportFilteredCandidates``, ``:900-910``).
+    """
+    if session.is_subagent:
+        # DSH nests a subagent under its parent session instead of listing it as a
+        # workspace member, and never accounts one in a workspace's sessionIds: on
+        # this machine, none of 194 subagent sessions appears in any record. That
+        # is the normal state, so it is not reported as a fault.
+        return None
+
+    holders = registry.holders(session.session_id)
+    if not holders:
+        return "no workspace accounts for it, so DSH lists it nowhere"
+    if len(holders) > 1:
+        titles = ", ".join(repr(workspace.title) for workspace in holders)
+        return f"accounted by {len(holders)} workspaces ({titles}); DSH refuses to start in this state"
+
+    holder = holders[0]
+    cwd = session.cwd
+    if cwd is None:
+        return f"accounted by {quote(holder.title)} but its header carries no cwd to validate"
+    resolved = resolved_spelling(cwd)
+    if resolved is None:
+        return f"accounted by {quote(holder.title)} but its cwd {quote(cwd)} does not resolve"
+    if resolved != holder.path:
+        return (
+            f"accounted by {quote(holder.title)} but its resolved cwd is {quote(resolved)}, not that "
+            f"workspace's stored path {quote(holder.path)}"
+        )
+    return None
+
+
+def verify_ownership(dsh_home: Path, session_id: str, target: Workspace) -> None:
+    """Re-read the registry and assert DSH will file the session under ``target``.
+
+    The artifact halves can be right while the ownership list still names the old
+    workspace, and that state is invisible in DSH rather than merely misplaced, so
+    it is asserted rather than assumed.
+
+    Raises:
+        ToolError: when the session is not owned by the target, or is still owned
+            by some other workspace.
+    """
+    registry = load_registry(dsh_home)
+    holders = registry.holders(session_id)
+    if not any(workspace.workspace_id == target.workspace_id for workspace in holders):
+        raise ToolError(
+            f"{session_id}: post-check failed, the workspace registry does not account for this "
+            f"session under {quote(target.title)}, so DSH will not list it"
+        )
+    others = [workspace.title for workspace in holders if workspace.workspace_id != target.workspace_id]
+    if others:
+        names = ", ".join(repr(title) for title in others)
+        raise ToolError(
+            f"{session_id}: post-check failed, the session is still accounted by {names}, "
+            "which makes it invisible in DSH"
+        )

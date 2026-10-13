@@ -30,7 +30,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .errors import ToolError
+from .errors import ToolError, quote
 from .operations import MovePlan, apply_plan, plan_move
 from .paths import encode_segment, project_key
 from .sessions import scan_sessions
@@ -60,6 +60,9 @@ class ContractReport:
     dsh_events: dict[str, int] = field(default_factory=dict)
     unreadable: dict[str, str] = field(default_factory=dict)
     tool_sessions: dict[str, str | None] = field(default_factory=dict)
+    membership: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    invisible: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     pre_existing: list[str] = field(default_factory=list)
     sample: Path | None = None
@@ -129,6 +132,11 @@ def _rows(value: object) -> list[object]:
     return value if isinstance(value, list) else []
 
 
+def _workspaces(paths: tuple[str, ...] | list[str]) -> str:
+    """Render the workspaces a session appears in, one quoted path at a time."""
+    return ", ".join(quote(path) for path in paths) if paths else "no workspace"
+
+
 def check(sessions_root: Path, *, dsh_home_path: str | None = None) -> ContractReport:
     """Compare this tool's view of ``sessions_root`` with DSH's own."""
     report = ContractReport(sessions_root=sessions_root, dsh_root=None)
@@ -157,6 +165,13 @@ def check(sessions_root: Path, *, dsh_home_path: str | None = None) -> ContractR
             cwd = row.get("cwd")
             report.dsh_sessions[session_id] = cwd if isinstance(cwd, str) else None
 
+    for message in _rows(probed.get("notes")):
+        report.notes.append(str(message))
+
+    for session_id, holders in _object(probed.get("membership")).items():
+        report.membership[str(session_id)] = tuple(str(item) for item in _rows(holders))
+    report.invisible = [str(item) for item in _rows(probed.get("invisible"))]
+
     for session_id, outcome in _object(probed.get("loaded")).items():
         row = _object(outcome)
         if row.get("ok"):
@@ -174,8 +189,8 @@ def check(sessions_root: Path, *, dsh_home_path: str | None = None) -> ContractR
     for session_id, cwd in sorted(report.dsh_sessions.items()):
         if session_id in report.tool_sessions and report.tool_sessions[session_id] != cwd:
             report.failures.append(
-                f"{session_id}: DSH reads cwd {cwd!r} but this tool reads "
-                f"{report.tool_sessions[session_id]!r}"
+                f"{session_id}: DSH reads cwd {quote(cwd)} but this tool reads "
+                f"{quote(report.tool_sessions[session_id])}"
             )
 
     for session_id, message in sorted(report.unreadable.items()):
@@ -290,8 +305,8 @@ def self_test(sessions_root: Path) -> ContractReport:
 
         if report.dsh_sessions.get(session_id) != str(workspace_a):
             report.failures.append(
-                f"before the move DSH reports {report.dsh_sessions.get(session_id)!r}, "
-                f"expected {str(workspace_a)!r}"
+                f"before the move DSH reports {quote(report.dsh_sessions.get(session_id))}, "
+                f"expected {quote(str(workspace_a))}"
             )
             return report
         if session_id not in report.dsh_events:
@@ -300,6 +315,14 @@ def self_test(sessions_root: Path) -> ContractReport:
             )
             return report
         before_events = report.dsh_events[session_id]
+
+        if report.membership.get(session_id) != (str(workspace_a),):
+            report.failures.append(
+                f"before the move DSH would show the session in "
+                f"{_workspaces(report.membership.get(session_id, ()))}, expected only "
+                f"{quote(str(workspace_a))}"
+            )
+            return report
 
         registry = load_registry(home)
         session = scan_sessions(home / "sessions").by_id(session_id)[0]
@@ -318,18 +341,47 @@ def self_test(sessions_root: Path) -> ContractReport:
         report.dsh_events = after.dsh_events
         report.unreadable = after.unreadable
         report.tool_sessions = after.tool_sessions
+        report.membership = after.membership
+        report.invisible = after.invisible
+        report.notes = after.notes
         report.failures.extend(after.failures)
         report.pre_existing.extend(after.pre_existing)
         report.skipped = after.skipped
 
         reported = report.dsh_sessions.get(session_id)
         if reported != str(workspace_b):
-            report.failures.append(f"after the move DSH reports {reported!r}, expected {str(workspace_b)!r}")
+            report.failures.append(
+                f"after the move DSH reports {quote(reported)}, expected {quote(str(workspace_b))}"
+            )
+        holders = report.membership.get(session_id)
+        if holders != (str(workspace_b),):
+            report.failures.append(
+                f"after the move DSH would show the session in {_workspaces(holders or ())}, "
+                f"expected only {quote(str(workspace_b))}; a session whose ownership list still "
+                "names the old workspace appears in no workspace at all"
+            )
         events = report.dsh_events.get(session_id)
         if events is None:
             report.failures.append("after the move DSH could not open the session")
         elif events != before_events:
             report.failures.append(
                 f"after the move DSH reads {events} events but read {before_events} before"
+            )
+
+        # Positive control. Put the ownership list back the way a one-sided move
+        # leaves it, and confirm the membership check notices. Without this, the
+        # assertion above could be passing for a reason that has nothing to do
+        # with the defect it exists to catch.
+        registry_file = home / "storages" / "workspace.json"
+        one_sided = json.loads(registry_file.read_text(encoding="utf-8"))
+        rows = one_sided["tables"]["workspaces"]
+        rows["b"]["sessionIds"] = [item for item in rows["b"]["sessionIds"] if item != session_id]
+        rows["a"]["sessionIds"] = [session_id, *rows["a"]["sessionIds"]]
+        registry_file.write_text(json.dumps(one_sided, indent=2) + "\n", encoding="utf-8")
+        control = check(home / "sessions")
+        if session_id not in control.invisible:
+            report.failures.append(
+                "the membership check did not notice a session left in the old workspace's "
+                "ownership list, so it cannot be trusted to notice the real thing"
             )
         return report

@@ -3,6 +3,17 @@
 from __future__ import annotations
 
 
+def quote(value: object) -> str:
+    """Wrap ``value`` in single quotes for a message, without escaping it.
+
+    ``repr`` is the obvious choice and the wrong one here. Every path this tool
+    talks about is a Windows path on this platform, and ``repr`` doubles each
+    backslash, so a refusal that names a path appears to name one containing two
+    of them.
+    """
+    return f"'{value}'"
+
+
 class ToolError(Exception):
     """An expected, user-facing failure.
 

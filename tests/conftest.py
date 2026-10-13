@@ -54,6 +54,8 @@ class FakeHome:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        #: ``(session_id, cwd)`` pairs, mirroring the ownership list DSH keeps.
+        self.created: list[tuple[str, str]] = []
 
     @property
     def sessions_root(self) -> Path:
@@ -102,12 +104,61 @@ class FakeHome:
             body = [*body, title_event(title, seq=len(body) + 2)]
 
         directory = self.sessions_root / project_key(cwd) / encode_segment(session_id)
-        return write_artifact(
+        path = write_artifact(
             directory,
             filename=filename or f"session.v{version}.jsonl.zstd",
             header=header,
             lines=body,
         )
+        self.attach(session_id, cwd)
+        return path
+
+    def attach(self, session_id: str, cwd: str) -> None:
+        """Record ``session_id`` as owned by the workspace whose path is ``cwd``.
+
+        DSH maintains this list on every create and attach
+        (``attachSession``, ``dsh-workspace/lib/index.js:111-129``), so a fixture
+        that leaves it empty is not modelling a state DSH can actually be in.
+        """
+        self.created.append((session_id, cwd))
+        self.sync_ownership()
+
+    def detach(self, session_id: str) -> None:
+        """Drop ``session_id`` from every record, modelling a stale ledger."""
+        if not self.workspace_state.is_file():
+            return
+        document = json.loads(self.workspace_state.read_text(encoding="utf-8"))
+        for record in document["tables"]["workspaces"].values():
+            record["sessionIds"] = [item for item in record["sessionIds"] if item != session_id]
+        self.workspace_state.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    def own_by_path(self, session_id: str) -> list[str]:
+        """The workspace paths whose record currently lists ``session_id``."""
+        document = json.loads(self.workspace_state.read_text(encoding="utf-8"))
+        return sorted(
+            record["path"]
+            for record in document["tables"]["workspaces"].values()
+            if session_id in record["sessionIds"]
+        )
+
+    def sync_ownership(self) -> None:
+        """File every created session under the workspace that owns its cwd."""
+        if not self.workspace_state.is_file():
+            return
+        document = json.loads(self.workspace_state.read_text(encoding="utf-8"))
+        rows = document["tables"]["workspaces"]
+        by_path = {record["path"]: key for key, record in rows.items()}
+        changed = False
+        for session_id, cwd in self.created:
+            key = by_path.get(cwd)
+            if key is None or session_id in rows[key]["sessionIds"]:
+                continue
+            rows[key]["sessionIds"] = [session_id, *rows[key]["sessionIds"]]
+            changed = True
+        if changed:
+            self.workspace_state.write_text(
+                json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="\n"
+            )
 
     def write_registry(
         self,
@@ -137,7 +188,8 @@ class FakeHome:
             "tables": {"workspaces": table},
         }
         self.workspace_state.parent.mkdir(parents=True, exist_ok=True)
-        self.workspace_state.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        self.workspace_state.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="\n")
+        self.sync_ownership()
 
 
 @pytest.fixture
