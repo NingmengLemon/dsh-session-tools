@@ -117,7 +117,7 @@ uv run dsh-sessions verify
 # 4. List the registry and every cwd group. `--from` shows each session's title,
 #    read from its log, its creation time, and its id, newest first.
 uv run dsh-sessions list
-uv run dsh-sessions list --from "E:\Projects\Python\UniversalWorkspace"
+uv run dsh-sessions list --from "D:\work\my-project"
 
 # 5. See what a move would do. Nothing is written. --session takes a full id, a
 #    unique id prefix, or a fragment of the title; an ambiguous one is refused and
@@ -243,13 +243,12 @@ Read this before trusting it with a library you care about.
   is not a registered workspace show as ungrouped in DSH; this tool will not move
   them *into* such a path, and it reports them so you can decide.
 * **`verify` parses every line as JSON, and that dominates its running time.** On
-  this machine's library, 349 artifacts and 318,632 frames take about 76 seconds.
-  A move does not pay that cost: it validates container integrity, which is what
-  it depends on, and leaves line parsing to `verify`.
-* The reports below are from the development library, and the numbers are
-  measured rather than estimated: 233 session directories, 108 of which hold
-  several retained generations, 349 artifacts, 601 MiB compressed, 318,632
-  frames.
+  the development library, 262 artifacts and 106,129 frames took about 27
+  seconds. A move does not pay that cost: it validates container integrity, which
+  is what it depends on, and leaves line parsing to `verify`.
+* The numbers quoted here are measured, not estimated, but they describe one
+  library at one time: 262 session directories and 262 artifacts, 353 MiB
+  compressed. Read them as an order of magnitude rather than a constant.
 * **Titles cost a full read of the listed session.** DSH keeps a title as a
   `session/title` event in the log, not in the header, so `list --from` decodes
   each listed session's current artifact to find the last one. Listing 54
